@@ -1,0 +1,539 @@
+---
+title: "Hierarchical Bayesian Generalized Linear Models for Predicting Stagnospora Nodorum Blotch in Winter Wheat"
+subtitle: "Simulation exercise"
+author: "Vinicius Garnica"
+date: "`r Sys.Date()`"
+format:
+  html:
+    self-contained: true
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    code-line-numbers: true
+    theme: cosmo
+    df-print: paged
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r setup, include=FALSE}
+# Knitr settings
+knitr::opts_chunk$set(
+  message=FALSE, 
+  warning=FALSE,
+  tidy=TRUE,
+  cache=TRUE,
+  echo = TRUE)
+
+
+### Set the path for workflow
+rm(list = ls())
+
+```
+
+
+## Introduction
+
+In this tutorial, we evaluate the statistical properties of the Bayesian approach adopted in the main article, using simulation to assess parameter bias under various asymptotic conditions. We conduct this exercise with and without the environmental relatedness matrix $\mathbf{K}^*$. This is demonstrated utilizing the R package brms, which offers a versatile interface for fitting Bayesian multilevel models using Stan. Using parameters of the model 5 (M5) developed in the main article, we generate data and fit a model under different scenarios of relatedness matrix ($\mathbf{K}^*$ and $I_j^*$), number of environments (*j*), and group-level standard deviation $\sigma^2_{\u}$ to investigate the sensitivity of our model estimates.
+
+## Methods
+
+A population of disease cases (a combination of wheat residue [*presence* and *absence*], SNB resistance [*S*, *MS*, and *MR*] in commercial cultivars, and site or environments) has been synthetically generated, with the population size varying between 8 and 10 cases per environment. The level 1 pre-planting predictors (L1) are nested within environments where meteorological measures are simulated. These environmental metrics are called level 2 (group-level) predictors because we assume them to be relatively uniform within an environment and the same for all level 1 units.
+
+In this exercise, we simulate disease severity on a scale from 0-100%, assumed to follow a beta distribution with parameters $\mu_{ij}^*$ and $\phi$. These parameters are combined to create $shape_1$ and $shape_2$, which are used by the beta distribution. Our modeling approach extends to encompass both non-correlated ($I_j^*$) and correlated random intercepts ($\mathbf{K}^*$). This extension is grounded in the assumption that trials conducted in the same year and region have more similar weather patterns than environments further apart or across years within the same location, thus share some degree of similarity.
+
+
+We used parameters derived from the M5 the main paper and altered the number of environments and group-level standard deviation $\sigma^2_{\u}$ to assess model sensitivity. Simulation also accounted for the frequencies of categorical predictors (agronomic, disease, and host factors) to represent field and experimental conditions of the study. This simulation results hold validity only within the assumptions made during the data generation process. In total, we simulate 1000 environments and randomly sample from them for regression coefficient sensitivity analysis.
+
+
+### Reading the data
+
+The following code shows the libraries needed for this tutorial.
+
+```{r Load libraries}
+
+### Load libraries
+library(tidyverse) # data wrangling 
+library(compiler) # to compile functions
+library(MASS) #multivariate normal function
+library(brms) # bayesian modeling
+library(tidybayes) # extract results
+library(Matrix) # positive matrix
+library(corpcor) # to make a matrix positive definite
+library(fitdistrplus) # to get empirical distributions
+rm(list = ls())
+
+```
+
+### Supporting functions
+
+We develop auxiliary functions for handling vectors and matrices and performing general data wrangling tasks.
+
+```{r Supporting functions}
+
+### Supporting functions
+# Function to create a design matrix based on the number of observations in each group
+dmat = cmpfun(function(i) {
+  j = length(i)
+  n = sum(i)
+  index = cbind(start = cumsum(c(1, i[-j])), stop = cumsum(i))
+  H = matrix(0, nrow = n, ncol = j)
+  for (i in 1:j) {
+    H[index[i, 1]:index[i, 2], i] = 1L
+  }
+  return(H)
+})
+
+# Function to simulate random normal variables based on the number of observations, mean, and standard deviation
+r = cmpfun(function(n, site_mean, sigma) {
+  dmat(n) %*% rnorm(length(n), site_mean, sigma)
+})
+
+# Function to apply the logistic function (logit) to a vector
+logit = cmpfun(function(xb) 1 / (1 + exp(-xb)))
+
+# Function to calculate the inverse of the logit function
+inverse_logit = function(p) {
+  log(p / (1 - p))
+}
+
+# Function to categorize a numeric vector into intervals based on quantiles
+mycut = cmpfun(function(x, p) {
+  cut(x = x, breaks = quantile(x, probs = p), labels = FALSE, include.lowest = TRUE)
+})
+
+# Function to create a histogram matrix for numeric variables in a data frame
+hgraph = cmpfun(function(data) {
+  oldpar = par(no.readonly = TRUE)
+  on.exit(par(oldpar))
+  
+  n = ncol(data)
+  ncol = ceiling(sqrt(n))
+  nrow = ceiling(n / ncol)
+  par(mfrow = c(nrow, ncol))
+  if (!is.null(colnames(data))) {
+    i = colnames(data)
+  } else {
+    i = seq(from = 1, to = n)
+  }
+  out = lapply(i, function(x) {
+    if (is.numeric(data[, x])) {
+      hist(data[, x], main = x, xlab = "")
+    } else barplot(table(data[, x]), main = x, xlab = "", ylab = "Frequency")
+  })
+  return(invisible(out))
+})
+
+# Function to fit the model and extract results
+priors =   c(set_prior("normal(1.8, 0.4)", class = "b",coef = "residueY"),  
+             set_prior("normal(1.6, 0.4)", class = "b",coef = "resistanceS"),  
+             set_prior("normal(1.1,1.3)", class = "b",coef = "resistanceMS"),  
+             set_prior("normal(0.8, 2.3)", class = "b",coef = "onsetPRE"),
+             set_prior("normal(-3.9, 5)", class = "b"),     
+             set_prior("gamma(2, 0.01)",class = "phi"), 
+             set_prior("cauchy(0, 2.5)", class = "sd"))
+
+
+chain = 4
+iter = 10000
+warmup = 2000
+cores = 4
+seed = 1234
+control = list(adapt_delta=0.99,max_treedepth=14)
+
+fit_sev = function(model_formula, data, cov_matrix = NULL,family = NULL) {
+  model_formula = as.formula(model_formula)  # Convert to formula
+  fit = brms:::brm(model_formula, 
+                   data = data, 
+                   data2 = list(cov_matrix = cov_matrix), 
+                   family=Beta(link = "logit"),
+                   prior = priors,
+                   chains = chain, 
+                   iter = iter,
+                   warmup = warmup,
+                   cores = cores, 
+                   seed = seed,
+                   control=control)
+          return(fit)
+}
+
+```
+
+## Empirical distributions of metereological predictors
+
+First, we approximated the distributions of the numerical weather-based predictors (referred to as **w1**–**w6**) using the empirical distributions of selected weather-based variables of the selected model.
+
+```{r}
+
+### Load weather variables
+#load('c:/Users/Garnica/Documents/GitHub/SNB_bayesian/data/pre_anthesis_variables.RData') 
+load('C:/Users/garnica.9/Downloads/pre_anthesis_variables.RData') 
+selected_pre_anthesis_predictors =  c("fa1.77_71.RH.G90.dusk.sum_14",
+                                      "fa1.66_58.R.0.6.rl.count2.daytime.sum_28",
+                                      "fa1.61_55.T.16T19.daytime.sum_28",  
+                                      "fa1.47_38.TRH.7T10nRH.G85.dawn.sum_14", 
+                                      "fa1.20_6.TR.19T22nR.G.0.2.daytime.sum_28", 
+                                      "fa1.14_7.TR.13T16nR.G.0.2.dawn.sum_21")  
+
+
+#The rest of FA1 meteorological predictors will be used for relatedness matrix
+weather_df = pre_anthesis_variables %>%
+  dplyr::select(all_of(selected_pre_anthesis_predictors) )
+
+# Add a tiny amount of 0.01 so we can get the empirical distributions
+weather_df = weather_df %>%
+  mutate(across(everything(), ~ . + 0.01)) # add a tiny bit to remove zeros
+
+
+lapply(weather_df, function(column) fitdist(column, "gamma"))
+```
+
+
+## Simulation
+
+Second, we employ a formula to simulate group-level predictors stored in the data frame D. Although we have standard errors for these regression coefficients, we treat them as fixed effects in the simulation. We then scale D in the same way it was scaled in the main paper. In this formula, we assume group-level predictors are distributed as gamma random variables due to their highly skewed nature and the need for them to be positive definite.
+
+Simulation also accounted for the frequencies of categorical predictors (agronomic, disease, and host factors), as show below. The $\mu_{ij}^2$ was then obtained using a logit link function applied to the linear combination of first- and second-level covariates, and vectors of random effects.
+
+```{r}
+
+sim.data.sev = function(mu, j, phi_sev, beta_L1, beta_L2, intercept_sev, sigma_alpha) {
+  # Number of disease cases within each environment
+  n = sample(8:10, size = j, replace = TRUE) 
+  
+  # Set seed for reproducibility
+  set.seed(123) 
+  
+  # Total number of disease cases
+  i = sum(n)  # Total number of cases across all sites
+  
+  # Simulate Level 2 weather predictors from empirical distributions. 
+  # These weather-based predictors are going to be explicitly modeled
+  b = data.frame(
+    site = factor(1:j),
+    w1 = rgamma(j, 3.09184093, 0.0225537),
+    w2 = rgamma(j, 4.3138318, 0.1435084),
+    w3 = rgamma(j, 9.29081981, 0.0394097),
+    w4 = rgamma(j, 1.66111697, 0.01868569),
+    w5 = rgamma(j, 2.19170572, 0.02177855),
+    w6 = rgamma(j, 0.46151069, 0.03402481)
+  )
+  
+  # Matrix multiplication of design matrix and weather predictors
+  D = dmat(n) %*% as.matrix(b[,-1])
+  D = as.data.frame(D) %>% left_join(., b)
+  D_scaled = scale(D[, !names(D) %in% "site"])  # Standardize predictors excluding the site column
+
+  # Environmental similarity information ---------------------------------------------------
+  num_vars = 100  # Number of variables for environmental similarity matrix
+  
+  # Generate random values
+  cov_values = runif(num_vars * (num_vars - 1) / 2)  # Random covariance values
+  
+  # Construct the correlation matrix
+  cov_matrix = matrix(0, nrow = num_vars, ncol = num_vars)
+  cov_matrix[upper.tri(cov_matrix)] = cov_values  # Upper triangle
+  cov_matrix = cov_matrix + t(cov_matrix)  # Symmetric matrix
+  
+  # Add diagonal elements (variances)
+  diag(cov_matrix) = runif(num_vars)
+  cov_matrix = as.matrix(nearPD(cov_matrix)$mat)  # Ensure positive definiteness
+  
+  # Simulate values using multivariate normal
+  vars = MASS::mvrnorm(j, rep(0, num_vars), Sigma = cov_matrix)
+  colnames(vars) = paste("Var", 1:num_vars, sep = "")
+  
+  # Center and scale the data
+  enm = scale(cbind(b[, -1], vars), center = TRUE, scale = TRUE)
+
+  # Calculate Euclidean distance K_true ---------------------------------------------------
+  p = as.matrix(dist(enm, method = "euclidean", diag = TRUE, upper = TRUE))
+  K_true = 1 - p / max(p, na.rm = TRUE)  # Similarity matrix
+  rownames(K_true) = colnames(K_true) = b[, 1]
+  
+  # Observed variables ------------------------------------------------------------------------------------------------------
+  # Here, we assume that we were able to capture 20 weather-based variables out of a 100.
+  # These variables will be used to construct the observed K matrix, for modeling purposes.
+  num_vars_obs = 20
+  enm2 = scale(cbind(vars[, 1: num_vars_obs]), center = TRUE, scale = TRUE)  
+  p2 = as.matrix(dist(enm2, method = "euclidean", diag = TRUE, upper = TRUE))
+  K_obs = 1 - p2 / max(p2, na.rm = TRUE)
+  rownames(K_obs) = colnames(K_obs) = b[, 1]
+  
+  # Vector of random intercepts with expected standard deviation and mean zero ---------------------------------------------------
+  A_sev = rnorm(j, 0, sigma_alpha)  # Random intercepts
+  
+  # Uncorrelated random intercepts
+  I_u = diag(j)
+  rownames(I_u) = colnames(I_u) = as.factor(1:j)
+  L_u = t(chol(I_u))
+  U0j_u_sev = (L_u %*% A_sev) # this is the vector of uncorrelated random effects
+  
+  # Correlated random intercepts with the true environmental relatedness matrix
+  L_c = t(chol(K_true))
+  U0j_c_sev = (L_c %*% A_sev) # this is the vector of correlated random effects
+  
+  # Level 1 categorical predictors ---------------------------------------------------
+  # These are simulated at a similar frequency as witht the data in the main paper
+  R = diag(3) 
+  rownames(R) = names(mu$cont)
+  R[1, 2] = 0.3
+  R[1, 3] = 0.45
+  R[2, 3] = -0.5
+  R = cov2cor(make.positive.definite(R))  # Ensure positive definiteness
+  p = list(residue = 0.5, resistance = c(0.2, 0.3, 0.5), onset = c(0.5, 0.5))
+  
+  Xc = list()
+  for (m in 1:j) {
+    Xc[[m]] = as.data.frame(MASS::mvrnorm(n = n[m], mu = rep(0, 3), Sigma = R)) # this creates a 
+    #certain degree of correlation frequency
+    Xc[[m]] = within(Xc[[m]], {
+      residue = factor(ifelse(is.na(mycut(residue, c(0, cumsum(p$residue)))), "N", "Y"))
+      resistance = factor(mycut(resistance, c(0, cumsum(p$resistance))), levels = c(1, 2, 3), labels = c("MR", "MS", "S"))
+      onset = factor(mycut(onset, c(0, cumsum(p$onset))), levels = c(1, 2), labels = c("POST", "PRE"))
+    })
+    Xc[[m]]$site = factor(m)
+  }
+  
+  
+  # Design matrix
+  X = model.matrix(~ 1 + residue + resistance + onset, data = bind_rows(Xc))[, -1]
+
+  # Linear combination of effects -------------------------------------------------------------------------------
+  fixed_effect_severity = X %*% beta_L1$estimate + D_scaled %*% beta_L2$estimate + intercept_sev[1]
+
+
+ outcome = data.frame(
+    bind_rows(Xc), 
+    D_scaled, 
+    mu_u_sev = plogis(fixed_effect_severity + U0j_u_sev[D$site]), 
+    mu_c_sev = plogis(fixed_effect_severity + U0j_c_sev[D$site])
+  )
+  
+  # Simulate data using the beta distribution and associated parameters  ------------------------------------------
+  outcome = outcome %>%
+    mutate(
+      shape1u = mu_u_sev * phi_sev[1],  # phi is fixed
+      shape1c = mu_c_sev * phi_sev[1],
+      shape2u = (1 - mu_u_sev) * phi_sev[1],
+      shape2c = (1 - mu_c_sev) * phi_sev[1],
+      severity_u = rbeta(i, shape1u, shape2u),
+      severity_c = rbeta(i, shape1c, shape2c),
+      n = n(),
+      sigma_alpha = sigma_alpha,
+      severity_u = (severity_u * (n - 1) + 0.5) / n, # this is just a transformation to 
+      #ensure the data is limited to 0-1 range
+      severity_c = (severity_c * (n - 1) + 0.5) / n # this is just a transformation to 
+      #ensure the data is limited to 0-1 range
+    )
+  
+  return(list(data = outcome, I_u = I_u, K_true = K_true, K_obs = K_obs, D = D, D_scaled = D_scaled))
+}
+
+```
+
+
+
+## Model Parameters
+
+We used parameters derived from M5 in the main paper and altered the group-level standard deviation $\sigma^2_{\u}$ to assess model sensitivity. 
+
+```{r Simulation parameters}
+
+# Total number of environments
+j = 1000
+
+# Intercept base and environmental variables means for variables explicitly modeled
+mu = list(int = 0, cont = c(residue = 0, resistance = 0, onset = 0))
+
+# Group-level standard deviation
+sigma_alpha = c(0.3,0.9)
+
+# Spread parameter and SE
+phi_sev = c(150.08,23.40)
+
+# Intercept and SE
+intercept_sev = c(-4.37,0.51)
+
+# First level predictors and SE
+beta_L1 = data.frame(
+  estimate = c(1.54, 0.25, 1.02, -0.01),
+  se = c(0.1, 0.09, 0.10, 0.11),
+  row.names = c('residueY', 'resistanceMS', 'resistanceS', 'onsetPRE')
+)
+
+# Second level predictors and SE
+beta_L2 = data.frame(
+  estimate = c(0.31, 0.33, 0.03, 0.03,-0.35, 0.10),
+  se = c(0.28, 0.33, 0.23, 0.23, 0.32, 0.18), 
+  row.names = c("w1", "w2", "w3", "w4", "w5", "w6"))
+
+```
+
+## Data Simulation
+
+We iterated the simulation procedure across varying group-level standard deviations ($\sigma^2_{\u}$ = 0.3 and 0.9). As explained above, we further created the observed and true environmental relatedness matrices ($\mathbf{K}^*$ and $\mathbf{K}_{obs}^*$). This decision was made due to our inability to capture all climatic factors associated with response, focusing instead on a subset of observed weather variables. 
+
+Consequently, we developed two matrices: one representing true values for data simulation purposes ($\mathbf{K}^*$; 100 environmental variables) and another comprising some of the observed variables ($\mathbf{K}_{obs}^*$; 20 environmental variables).
+
+The code snippet generates and stores simulated disease severity data for different values of $\sigma^2_{\u}$. The results, including the data, observed and true environmental relatedness matrices ($\mathbf{K}_{obs}^*$ and $\mathbf{K}^*$), and distribution of environmental metrics (D and D_scaled), are stored in the data_final_sev dataframe list.
+
+```{r Severity data}
+
+data_final_sev = list(data = list())
+
+for (k in sigma_alpha) {
+  sim_result = sim.data.sev(mu, j, phi_sev, beta_L1, beta_L2, intercept_sev, k)
+  data_final_sev$data[[as.character(k)]] = sim_result$data
+  K_obs = sim_result$K_obs
+  K_true = sim_result$K_true
+  D = sim_result$D
+  D_scaled = sim_result$D_scaled
+}
+```
+
+
+
+## Data visualization
+
+Here, we explore the variables created along with the environmental matrices ($\mathbf{K}_{obs}^*$ and $\mathbf{K}^*$).
+
+### Distribution of explicit and scaled weather parameters (w1 through w6)
+```{r}
+hgraph(D_scaled)
+```
+
+
+### The $\mathbf{K}^*$ matrix
+This graph depicts the pairwise correlations between 1000 environments using 100 weather predictors. This matrix is only used for simulation purposes. You should compare this matrix to the $\mathbf{K}_{obs}^*$.
+
+```{r}
+heatmap(K_true)
+```
+
+### The $\mathbf{K}_{obs}^*$ matrix
+This graph shows the pairwise correlations between 1000 environments using 20 weather predictors. This matrix is used solely for modeling and sensitivity analysis, as explained in the main article. This approach is based on the understanding that we cannot fully observe, calculate, or create all variables influencing disease and crop responses, but we aim to capture the key ones.
+
+```{r}
+heatmap(K_obs)
+```
+
+
+### Disease severity values
+
+```{r}
+hist(data_final_sev$data$"0.3"$severity_u,breaks = 100,main = "Matrix I_j with sigma = 0.3")
+```
+
+```{r}
+hist(data_final_sev$data$"0.3"$severity_c,breaks = 100,main = "Matrix K_j with sigma = 0.3")
+```
+
+```{r}
+hist(data_final_sev$data$"0.9"$severity_u,breaks = 100,main = "Matrix I_j with sigma = 0.9")
+```
+
+```{r}
+hist(data_final_sev$data$"0.9"$severity_c,breaks = 100,main = "Matrix K_j with sigma = 0.9")
+```
+
+### Saving data
+We run the next section in a HPC environment, so the data must be stored elsewhere. Note the **K_j_obs** matrix used for modeling is the observed matrix of environmental similarity, based on 20 weather variables and not true **K_j_true** matrix, composed of a 100 weather variables. Only **K_j_obs** is used in the modeling part. 
+
+```{r Save ,eval=FALSE}
+save(data_final_sev,file ="simulation/data_final_sev.RData")
+save(K_obs,file ="simulation/K_obs.RData")
+```
+
+## Model Fit
+
+We iterate over our parameters, fitting models and extracting results. Besides changing ($\sigma^2_{\u}$ = 0.3 and 0.9), we also sampled the levels of random effects (j = 10, 25, 50, 100, 150, and 250). This is allows us to understand the sensitivity of parameter estimates in mixed models.
+
+```{r Severity Fitting,eval=FALSE}
+
+
+# Number of environments sampled
+m = c(10,25,50,100,150,250)
+
+# Initialize lists to store sampled sites, data, and correlation matrices
+sampled_site = list()
+dt = list()
+K_obs_list = list()
+
+result_sev_u = list()
+result_sev_c = list()
+
+# Iterate over different sigma_alpha values
+for(k in sigma_alpha){
+  # Iterate over different sample sizes
+  for(i in m){
+    # Sample site
+    sampled_site[[as.character(k)]] = sample(data_final_sev$data[[as.character(k)]]$site, i, replace = FALSE)
+    
+    # Subset dt_sev
+    dt[[as.character(k)]] = data_final_sev$data[[as.character(k)]][data_final_sev$data[[as.character(k)]]$site %in% sampled_site[[as.character(k)]], ]
+  
+  
+    # Subset C_c
+    K_obs_list[[as.character(k)]] = K_obs[rownames(K_obs) %in% sampled_site[[as.character(k)]], colnames(K_obs) %in% sampled_site[[as.character(k)]], drop = FALSE]
+
+
+# Uncorrelated ------------------------------------------------------------------------------------------------
+  
+      # Fit models and extract results for uncorrelated cases
+      result_sev_u[[paste0("k", as.character(k), "_m", i)]] = 
+      fit_sev("severity_u ~ 1 + residue + resistance + onset + (1|site) + w1 + 
+              w2 + w3 + w4 + w5 + w6", dt[[as.character(k)]]) %>%
+        tidybayes::spread_draws(b_Intercept, phi, b_residueY, b_resistanceMS, b_resistanceS, 
+                                b_onsetPRE, b_w1, b_w2, b_w3, 
+                                b_w4, b_w5, b_w6,
+                                sd_site__Intercept) %>%
+        summarise_draws() %>%
+        dplyr::select(variable, mean, q5, q95)
+      result_sev_u[[paste0("k", as.character(k), "_m", i)]]$m = i
+      result_sev_u[[paste0("k", as.character(k), "_m", i)]]$k =  k
+      result_sev_u[[paste0("k", as.character(k), "_m", i)]]$cov = "uncorrelated"
+      result_sev_u[[paste0("k", as.character(k), "_m", i)]]$true = 
+        c(intercept_sev[1], phi_sev[1], beta_L1$estimate, beta_L2$estimate, k)
+     
+  # Correlated ------------------------------------------------------------------------------------------------
+  
+  # Fit models and extract results for correlated cases
+  result_sev_c[[paste0("k", as.character(k), "_m", i)]] = 
+        fit_sev("severity_c ~ 1 + residue + resistance + onset + (1|gr(site, cov = cov_matrix)) + w1 +
+                w2 + w3 + w4 + w5 + w6", dt[[as.character(k)]], cov_matrix = K_obs_list[[as.character(k)]]) %>%
+    tidybayes::spread_draws(b_Intercept, phi, b_residueY, b_resistanceMS, b_resistanceS, 
+                            b_onsetPRE, b_w1, b_w2, b_w3, 
+                            b_w4, b_w5, b_w6,
+                            sd_site__Intercept) %>%
+    summarise_draws() %>%
+    dplyr::select(variable, mean, q5, q95)
+  result_sev_c[[paste0("k", as.character(k), "_m", i)]]$m = i
+  result_sev_c[[paste0("k", as.character(k), "_m", i)]]$k =  k
+  result_sev_c[[paste0("k", as.character(k), "_m", i)]]$cov = "correlated"
+  result_sev_c[[paste0("k", as.character(k), "_m", i)]]$true = 
+    c(intercept_sev[1], phi_sev[1], beta_L1$estimate, beta_L2$estimate, k)
+  }
+}
+  
+  
+# Combine the results into a single data frame and save
+sev_u = do.call(rbind, result_sev_u)
+sev_c = do.call(rbind, result_sev_c)
+
+save(sev_u, file = "C:/Users/garnica.9/Downloads/sev_u.RData")
+save(sev_c, file = "C:/Users/garnica.9/Downloads/sev_c.RData")
+
+
+```
+
+
+
+
+
+
+
+

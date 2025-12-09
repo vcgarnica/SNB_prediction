@@ -1,0 +1,2383 @@
+---
+title: "Hierarchical Bayesian Generalized Linear Models for Predicting Stagnospora Nodorum Blotch in Winter Wheat"
+subtitle: "Part I: Model Development and Evaluation"
+author: "Vinicius Garnica"
+date: "`r Sys.Date()`"
+format:
+  html:
+    self-contained: true
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    code-line-numbers: true
+    theme: cosmo
+    df-print: paged
+execute:
+  cache: false        # Disable caching
+  freeze: false       # Don't freeze computations
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+# Knitr settings
+knitr::opts_chunk$set(
+  message=FALSE, 
+  warning=FALSE,
+  tidy=TRUE,
+  cache=TRUE,
+  echo = TRUE)
+```
+
+[GitHub Repository](https://github.com/vcgarnica/SNB_prediction)  
+
+This file contains the full R workflow for processing and analyzing raw data, as well as generating figures for the manuscript. The Rmarkdown file can be downloaded from the *Code* drop down menu (top right).
+
+
+# Overview {-}
+
+This document presents a comprehensive analysis for developing predictive models of Stagnospora nodorum blotch (SNB) disease severity in winter wheat across North Carolina. We compare Bayesian hierarchical modeling approaches with machine learning methods (XGBoost) to identify key environmental and management factors influencing disease development.
+
+## Objectives {-}
+
+1. Develop robust predictive models for SNB severity using multi-year, multi-location field data
+2. Compare Bayesian hierarchical GLMs with XGBoost machine learning approaches
+3. Identify critical pre-anthesis weather variables and management practices affecting disease
+
+### Study design {-}
+
+*Data Collection*: Field trials conducted across multiple sites in North Carolina over multiple growing seasons
+
+*Response Variable*: SNB disease severity (proportion scale, 0-1)
+
+*Predictor Categories*:
+- Pre-anthesis weather variables (temperature, humidity, precipitation)
+- Management practices (crop residue, wheat resistance)
+- Variety characteristics
+
+*Validation Strategy*:
+- CV0 (held out validation): cross-validation using four randomly selected sites completely held out for testing
+
+
+### Load packages {-}
+
+```{r load-packages}
+# Statistical modeling
+library(brms)           # Bayesian regression models
+library(tidymodels)     # Machine learning framework
+library(marginaleffects) # Marginal effects and predictions
+
+# Machine learning
+library(xgboost)        # Gradient boosting
+library(vip)            # Variable importance plots
+library(caret)          # Data processing
+
+# Data manipulation and visualization
+library(tidyverse)      # Data wrangling
+library(data.table)     # Fast data operations
+library(patchwork)      # Combine plots
+
+# Bayesian tools
+library(tidybayes)      # Tidy Bayesian analysis
+library(extraDistr)     # Additional distributions
+
+# Visualization
+library(scales)         # Scale functions for ggplot2
+library(ggbeeswarm)     # Beeswarm plots
+library(gghalves)       # Half-half plots
+library(ggtext)         # Enhanced text rendering
+
+# Clean workspace
+rm(list = ls())
+
+# Set default theme
+theme_set(theme_bw(base_size = 10))
+```
+
+```{r, echo=FALSE, color-palette}
+harmonious_palette = c(
+  "#8fa2a8", # Cool gray-blue
+  "#6b8c9c", # Steel blue
+  "#8CA58C", # Muted sage green (residue absent)
+  "#D9C8A7", # Warm sand (residue present)
+  "#A8BED0", # Light powder blue
+  "#CCD8D4", # Pale seafoam (pre-anthesis)
+  "#B5C8C9", # Silver teal
+  "#ADC8E8", # Soft cornflower (MS resistance)
+  "#8B9BB4", # Dusky periwinkle
+  "#6B8C95", # Deep teal (S resistance)
+  "#A3A8A8", # Cool gray
+  "#5A6D7C", # Slate blue
+  "#9B8CA5"  # Muted lavender (post-anthesis)
+)
+```
+
+```{r, functions, echo=FALSE}
+### Prediction function
+predict_xgboost = function(data, model) {
+    data$model_tree_pred = predict(model, new_data = data) |> pull(.pred)
+    metrics_summary = metrics(data, truth = sev, estimate = model_tree_pred)
+    
+    rmse_value = metrics_summary |>
+      filter(.metric == "rmse") |>
+      pull(.estimate)
+    
+    mae_value = metrics_summary |>
+      filter(.metric == "mae") |>
+      pull(.estimate)
+    
+    return(list(data = data, rmse = rmse_value, mae = mae_value))
+}
+
+plot_xgboost_predictions = function(model, data) {
+  
+  dt = predict_xgboost(data, model)
+  
+  A = ggplot(dt$data, aes(x = sev * 100, y = model_tree_pred * 100)) +
+    geom_point(size = 3, alpha = 0.6, color = harmonious_palette[5]) +
+    geom_abline(linetype = "dashed", color = "gray40", linewidth = 0.9) +
+    geom_smooth(se = FALSE, color = harmonious_palette[1], linewidth = 1.9, 
+                method = 'loess', formula = 'y ~ x') +
+    coord_cartesian(xlim = c(0, 31), ylim = c(0, 70)) +
+    labs(x = "Observed severity (%)", y = "Predicted severity (%)") +
+    theme(
+      aspect.ratio = 1,
+      panel.grid.minor = element_blank()
+    )
+  
+  B = dt$data |>
+    mutate(error = model_tree_pred - sev) |>
+    ggplot(aes(x = sev * 100, y = error * 100)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray40", linewidth = 0.8) +  
+    geom_point(size = 3, alpha = 0.6, color = harmonious_palette[5]) +
+    geom_smooth(se = FALSE, linewidth = 1.9, method = 'loess', formula = 'y ~ x',
+                color = harmonious_palette[1]) +
+    labs(x = "Observed severity (%)", y = "Prediction error (%)") +
+    coord_cartesian( xlim = c(0, 31), ylim = c(-30, 50)) +
+    theme(
+      aspect.ratio = 1,
+      panel.grid.minor = element_blank()
+    )
+  
+  (A + B) + 
+    plot_annotation(tag_levels = 'A')
+}
+
+
+heatmap_plot = function(correlation_matrix) {
+  heatmap_df = as.data.frame(correlation_matrix)
+  heatmap_df$Row = rownames(heatmap_df)
+  heatmap_df_long = reshape2::melt(heatmap_df, id.vars = "Row", 
+                                    variable.name = "Column", value.name = "Value")
+  
+  eclid = hclust(dist(1 - correlation_matrix), method = "complete")
+  ordered_labels = eclid$labels[eclid$order]
+  
+  heatmap_df_long = heatmap_df_long |>
+    mutate(Row = factor(Row, levels = ordered_labels),
+           Column = factor(Column, levels = ordered_labels))
+  
+  ggplot(heatmap_df_long, aes(x = Row, y = Column, fill = Value, label = round(Value, 2))) +
+    geom_tile(data = subset(heatmap_df_long, Row == Column), fill = "#8b5d73") +
+    scale_fill_gradientn(colors = c("#a4c3b2", "#5e7480"), limits = c(0, 1)) +
+    geom_tile(color = "white") +
+    geom_text(color = "white", size = 3, fontface = "bold") +
+    scale_y_discrete(limits = ordered_labels) +
+    labs(fill = "Correlation") +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      axis.text.y = element_text(angle = 0, hjust = 1),
+      legend.position = "bottom",
+      axis.title = element_blank(),
+      panel.grid = element_blank()
+    )
+}
+
+
+calculate_metrics_bayes = function(data, pred_col, true_col, ci_lower, ci_upper) {
+  rmse = sqrt(mean((data[[pred_col]] - data[[true_col]])^2))
+  mae = mean(abs(data[[pred_col]] - data[[true_col]]))
+  picp = mean(data[[true_col]] >= data[[ci_lower]] & data[[true_col]] <= data[[ci_upper]])
+  return(list(RMSE = rmse, MAE = mae, PICP = picp))
+}
+
+
+predict_bayes = function(data, model) {
+  preds = predict(model, newdata = data, re_formula = NA, allow_new_levels = TRUE,
+                  sample_new_levels = "uncertainty", 
+                  probs = c(0.025, 0.15, 0.85, 0.975))
+  
+  data$model_bayes_pred = preds[, 1]      # Estimate
+  data$model_bayes_Q2.5 = preds[, 3]      # Q2.5 (lower 95% CI)
+  data$model_bayes_Q15 = preds[, 4]       # Q15 (lower 70% CI)
+  data$model_bayes_Q85 = preds[, 5]       # Q85 (upper 70% CI)
+  data$model_bayes_Q97.5 = preds[, 6]     # Q97.5 (upper 95% CI)
+  
+  return(data)
+}
+
+plot_bayesian_predictions = function(model, data, n_bins = 10) {
+  dt = predict_bayes(data, model)
+  
+  # Create consistent bin breaks for both plots
+  # Extend breaks slightly beyond data range to ensure coverage
+  data_min = min(dt$sev * 100)
+  data_max = max(dt$sev * 100)
+  bin_breaks = seq(data_min - 0.1, data_max + 0.1, length.out = n_bins + 1)
+  
+  # Binned data for predictions
+  dt_binned = dt |>
+    mutate(obs_bin = cut(sev * 100, breaks = bin_breaks, include.lowest = TRUE)) |>
+    group_by(obs_bin) |>
+    summarize(
+      obs_mean = mean(sev * 100),
+      pred_mean = mean(model_bayes_pred * 100),
+      pred_lower_95 = mean(model_bayes_Q2.5 * 100),
+      pred_upper_95 = mean(model_bayes_Q97.5 * 100),
+      pred_lower_70 = mean(model_bayes_Q15 * 100),
+      pred_upper_70 = mean(model_bayes_Q85 * 100),
+      n = n(),
+      .groups = 'drop'
+    ) |>
+    filter(!is.na(obs_bin), n > 0)  # Changed from n > 1 to n > 0
+  
+  # Add extension points at edges for smooth ribbon coverage
+  # This ensures ribbons extend to the outermost data points
+  if (nrow(dt_binned) > 0) {
+    # Get min and max observed values
+    obs_range = range(dt$sev * 100)
+    
+    # Add extrapolated points at edges if needed
+    min_binned = min(dt_binned$obs_mean)
+    max_binned = max(dt_binned$obs_mean)
+    
+    if (obs_range[1] < min_binned) {
+      first_row = dt_binned[1, ]
+      first_row$obs_mean = obs_range[1]
+      dt_binned = bind_rows(first_row, dt_binned)
+    }
+    
+    if (obs_range[2] > max_binned) {
+      last_row = dt_binned[nrow(dt_binned), ]
+      last_row$obs_mean = obs_range[2]
+      dt_binned = bind_rows(dt_binned, last_row)
+    }
+  }
+  
+  # Plot A: Predicted vs Observed
+  A = ggplot() +
+    geom_ribbon(
+      data = dt_binned, 
+      aes(x = obs_mean, ymin = pred_lower_95, ymax = pred_upper_95),
+      alpha = 0.15, fill = harmonious_palette[3]
+    ) +
+    geom_ribbon(
+      data = dt_binned,
+      aes(x = obs_mean, ymin = pred_lower_70, ymax = pred_upper_70),
+      alpha = 0.2, fill = harmonious_palette[2]
+    ) +
+    geom_point(
+      data = dt, 
+      aes(x = sev * 100, y = model_bayes_pred * 100),
+      size = 3, alpha = 0.6, color = harmonious_palette[5]
+    ) +
+    geom_abline(linetype = "dashed", color = "gray40", linewidth = 0.9) +
+    geom_line(
+      data = dt_binned, 
+      aes(x = obs_mean, y = pred_mean),
+      color = harmonious_palette[1], linewidth = 1.9
+    ) +
+    coord_cartesian(ratio = 1, xlim = c(0, 31), ylim = c(0, 70)) +
+    labs(x = "Observed severity (%)", y = "Predicted severity (%)") +
+    theme(
+      legend.position = "none",
+      aspect.ratio = 1,
+      panel.grid.minor = element_blank()
+    )
+  
+  # Binned data for residuals
+  dt_residual_binned = dt |>
+    mutate(obs_bin = cut(sev * 100, breaks = bin_breaks, include.lowest = TRUE)) |>
+    group_by(obs_bin) |>
+    summarize(
+      obs_mean = mean(sev * 100),
+      residual_mean = mean((model_bayes_pred - sev) * 100),
+      residual_lower_95 = mean((model_bayes_Q2.5 - sev) * 100),
+      residual_upper_95 = mean((model_bayes_Q97.5 - sev) * 100),
+      residual_lower_70 = mean((model_bayes_Q15 - sev) * 100),
+      residual_upper_70 = mean((model_bayes_Q85 - sev) * 100),
+      n = n(),
+      .groups = 'drop'
+    ) |>
+    filter(n > 0)  # Changed from n > 1 to n > 0
+  
+  # Add extension points at edges for residuals
+  if (nrow(dt_residual_binned) > 0) {
+    obs_range = range(dt$sev * 100)
+    
+    min_binned_res = min(dt_residual_binned$obs_mean)
+    max_binned_res = max(dt_residual_binned$obs_mean)
+    
+    if (obs_range[1] < min_binned_res) {
+      first_row = dt_residual_binned[1, ]
+      first_row$obs_mean = obs_range[1]
+      dt_residual_binned = bind_rows(first_row, dt_residual_binned)
+    }
+    
+    if (obs_range[2] > max_binned_res) {
+      last_row = dt_residual_binned[nrow(dt_residual_binned), ]
+      last_row$obs_mean = obs_range[2]
+      dt_residual_binned = bind_rows(dt_residual_binned, last_row)
+    }
+  }
+  
+  # Plot B: Residuals
+  B = ggplot() +
+    geom_ribbon(
+      data = dt_residual_binned,
+      aes(x = obs_mean, ymin = residual_lower_95, ymax = residual_upper_95),
+      alpha = 0.15, fill = harmonious_palette[3]
+    ) +
+    geom_ribbon(
+      data = dt_residual_binned,
+      aes(x = obs_mean, ymin = residual_lower_70, ymax = residual_upper_70),
+      alpha = 0.2, fill = harmonious_palette[2]
+    ) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray40", linewidth = 0.9) +
+    geom_point(
+      data = dt, 
+      aes(x = sev * 100, y = (model_bayes_pred - sev) * 100),
+      size = 3, alpha = 0.6, color = harmonious_palette[5]
+    ) +
+    geom_line(
+      data = dt_residual_binned, 
+      aes(x = obs_mean, y = residual_mean),
+      color = harmonious_palette[1], linewidth = 1.9
+    ) +
+    coord_cartesian(ratio = 1, xlim = c(0, 31), ylim = c(-30, 50)) +
+    labs(x = "Observed severity (%)", y = "Prediction error (%)") +
+    theme(
+      legend.position = "none",
+      aspect.ratio = 1,
+      panel.grid.minor = element_blank()
+    )
+  
+  # Combine plots
+  (A + B) + 
+    plot_annotation(tag_levels = 'A')
+}
+```
+
+
+## Data Preparation {.tabset}
+
+### Load and transform SNB data {-}
+
+```{r data-load}
+# Load disease severity data
+load('data/SNB.RData')  # BLUEs (Best Linear Unbiased Estimates) for each disease case
+
+# Apply Smithson-Verkuilen transformation to handle boundary values
+# This transformation converts proportions with 0 and 1 values to open interval (0,1)
+# Formula: (y*(n-1) + 0.5) / n, where y is original proportion
+n = nrow(SNB)
+SNB$sev = round((SNB$sev / 100 * (n - 1) + 0.5) / n, 3)
+
+# Ordering levels 
+SNB$site = factor(SNB$site)
+SNB$region = factor(SNB$region)
+SNB$residue = factor(SNB$residue, levels = c("N", "Y"))
+SNB$resistance = factor(SNB$resistance, levels = c("MR", "MS","S"))
+SNB$snb_onset = factor(SNB$snb_onset, levels = c("post_anthesis","pre_anthesis"))
+```
+
+Data was originally organized in Rdata. The `SNB.RData` contains data on the outcome (`sev_lsm`), which is continuous with support ]0,1[, and several plot-level covariates. Plot-level covariates include cultivar (a categorical variable indicating susceptible [S], moderately susceptible [MS], and moderately resistant [MR]), residue (whether is present or not), site, and sigma (the residual standard error for each trial), and whether SNB onset was before or after anthesis, and region (a third group-level).
+
+```{r}
+skimr::skim(SNB)
+```
+
+
+## Exploratory data analysis {.tabset}
+
+### Severity distribution
+
+```{r, echo=FALSE}
+dist=ggplot(SNB) +
+  geom_histogram(aes(x = sev*100), fill = harmonious_palette[2], color = "black", binwidth =2,linewidth = 0.08,alpha=0.4) +
+  labs(x = "End-of-season SNB severity (%)", y = "Frequency of disease cases") +
+  
+  theme(plot.margin = margin(1, 1, 1, 1, "cm"),
+        plot.background = element_blank(),
+        plot.title.position = "plot",
+        legend.position =  "none",
+        aspect.ratio = 0.8);dist
+
+
+#eco + dist + plot_annotation(tag_levels = 'A') & theme(text = element_text(size = 12)) 
+
+#ggsave("results/figures/fig1.tiff",width =12,height = 6.5,units = "in",limitsize = FALSE)
+
+
+```
+
+```{r}
+sum(SNB$sev<0.03)/nrow(SNB)
+sum(SNB$sev>0.20)/nrow(SNB)
+```
+Note large number of lower than 3% severity cases
+
+### Wheat residue
+
+```{r}
+table(SNB$residue)
+```
+Balanced number of cases for residue
+
+```{r,echo=F}
+ggplot(SNB, aes(x = residue, y = sev)) +
+  geom_half_point(aes(color = residue), 
+                  transformation = position_quasirandom(width = 0.1),
+                  side = "l", alpha = 0.5) +
+  geom_half_boxplot(aes(fill = residue), side = "r") + 
+  scale_color_manual(values = harmonious_palette[c(4, 3)]) +
+  scale_fill_manual(values = harmonious_palette[c(4, 3)]) +
+  scale_y_continuous(labels = label_percent()) +
+  guides(color = "none", fill = "none") +
+  labs(x = "Residue", y = "End-of-season SNB severity") 
+
+ggplot(SNB, aes(x = sev, fill = residue)) +
+  geom_density(alpha = 0.6) +
+  scale_fill_manual(values = harmonious_palette[c(4, 3)]) +
+  scale_x_continuous(labels = label_percent()) +
+  labs(x = "End-of-season SNB severity", y = "Density", fill = "Residue") +
+  theme(legend.position = "bottom")
+
+```
+
+The presence of *P. nodorum*-infested wheat residue consistently increases disease severity, confirming the importance of residue management as a cultural control strategy.
+
+
+### Cultivar resistance (Reaction classes to SNB)
+
+```{r}
+table(SNB$resistance)
+table(SNB$resistance)/nrow(SNB)
+```
+Higher number of moderately susceptible and lowest number of observations with resistant cultivars.
+
+```{r,echo=F}
+ggplot(SNB, aes(x = resistance, y = sev)) +
+  geom_half_point(aes(color = resistance), 
+                  transformation = position_quasirandom(width = 0.1),
+                  side = "l", alpha = 0.5) +
+  geom_half_boxplot(aes(fill = resistance), side = "r") + 
+  scale_color_manual(values = harmonious_palette[c(13,5,6)]) +
+  scale_fill_manual(values = harmonious_palette[c(13,5,6)]) +
+  scale_y_continuous(labels = label_percent()) +
+  guides(color = "none", fill = "none") +
+  labs(x = "Resistance", y = "End-of-season SNB severity") 
+
+
+ggplot(SNB, aes(x = sev, fill = resistance)) +
+  geom_density(alpha = 0.6) +
+  scale_fill_manual(values = harmonious_palette[c(13,5,6)]) +
+  scale_x_continuous(labels = label_percent()) +
+  labs(x = "End-of-season SNB severity", y = "Density", fill = "Resistance") +
+  theme(legend.position = "bottom")
+
+```
+Another factor associated with disease intensity is cultivar resistance. Resistant (R) cultivars have an genetic architecture that prevents fungi colonization and development. Moderate (M) and susceptible (S) cultivars are more prone to disease development.
+
+### SNB onset timing
+
+```{r}
+# How many observations report SNB onset?
+table(SNB$snb_onset)
+table(SNB$snb_onset)/nrow(SNB)
+```
+The lowest number of observations with SNB onset occurred during vegetative stages of the wheat crop.
+
+```{r,echo=F}
+ggplot(SNB, aes(x = snb_onset, y = sev)) +
+  geom_half_point(aes(color = snb_onset), 
+                  transformation = position_quasirandom(width = 0.1),
+                  side = "l", alpha = 0.5) +
+  geom_half_boxplot(aes(fill = snb_onset), side = "r") + 
+  scale_color_manual(values = harmonious_palette[c(8, 12)]) +
+  scale_fill_manual(values = harmonious_palette[c(8, 12)]) +
+  scale_y_continuous(labels = label_percent()) +
+  guides(color = "none", fill = "none") +
+  labs(x = "Disease onset stage", y = "End-of-season SNB severity") 
+
+ggplot(SNB, aes(x = sev, fill = snb_onset)) +
+  geom_density(alpha = 0.6) +
+  scale_fill_manual(values = harmonious_palette[c(8, 12)]) +
+  scale_x_continuous(labels = label_percent()) +
+  labs(x = "End-of-season SNB severity", y = "Density", fill = "Disease onset stage") +
+  theme(legend.position = "bottom")
+
+```
+The earlier infection, the higher values of disease severity. There are some remarkable differences in the densities.
+
+
+### Environmental variation
+
+```{r}
+table(SNB$site)
+```
+
+```{r,echo=F}
+ggplot(SNB, aes(x = site, y = sev)) +
+  geom_half_boxplot(aes(fill = site), side = "r") + 
+  scale_y_continuous(labels = label_percent()) +
+  guides(color = "none", fill = "none") +
+  labs(x = "Sites", y = "End-of-season SNB severity") 
+```
+
+### Regional distribution
+
+```{r}
+table(SNB$region)
+table(SNB$region)/sum(nrow(SNB))
+```
+Greatest number of observations for Piedmont, followed by Southern plains and tidewater. 
+
+```{r,echo=F}
+ggplot(SNB, aes(x = region, y = sev)) +
+  geom_half_boxplot(aes(fill = region), side = "r") + 
+  scale_fill_manual(values = harmonious_palette) +
+  scale_y_continuous(labels = label_percent()) +
+  guides(color = "none", fill = "none") +
+  labs(x = "Regions", y = "End-of-season SNB severity")
+```
+
+
+## Pre-anthesis weather predictors {-}
+
+
+```{r}
+### Pre-anthesis weather variables
+load('data/pre_anthesis_variables.RData') 
+
+skimr::skim(pre_anthesis_variables)
+```
+Note that pre_anthesis_variables variables do not contain "-", because they are collected pre-anthesis. Negative signs on variable names means they involve calculations with LAG post anthesis in our code.
+
+```{r, echo=FALSE}
+  
+type = sapply(names(pre_anthesis_variables)[-1], function(x) {
+  if (grepl("\\.TRH\\.", x)) {
+    return("TRH")
+  } else if (grepl("\\.TR\\.", x)) {
+    return("TR")
+  } else if (grepl("\\.RH\\.", x)) {
+    return("RH")
+  } else if (grepl("\\.R\\.", x)) {
+    return("R")
+  } else if (grepl("\\.RH8.peak4\\.", x)) {
+    return("RH6.peak4")
+  } else if (grepl("\\.T8.peak4\\.", x)) {
+    return("T6.peak4")
+  } else if (grepl("\\.T\\.", x)) {
+    return("T")
+  } else if (grepl("\\.ETo\\.", x)) {
+    return("ETo")
+  }
+})
+intra = sapply(names(pre_anthesis_variables[-1]), function(x) {
+  if (grepl("\\.nighttime\\.", x)) {
+    return("nighttime")
+  } else if (grepl("\\.dusk\\.", x)) {
+    return("dusk")
+  } else if (grepl("\\.24h\\.", x)) {
+    return("24h")
+  } else if (grepl("\\.dawn\\.", x)) {
+    return("dawn")
+  } else if (grepl("\\.daytime\\.", x)) {
+    return("daytime")
+  }
+})
+
+# Categorize the numeric values into 10-unit ranges
+prefix = sapply(strsplit(names(pre_anthesis_variables)[-1], "_"), function(x) x[1])
+prefix_numeric = sapply(prefix, function(x) {
+  match = sub(".*\\.([0-9]+)$", "\\1", x)
+  
+  as.numeric(match)
+})
+prefix_bins = cut(prefix_numeric, breaks = seq(0, 100, by = 10), right = FALSE, include.lowest = TRUE)
+
+
+table(unlist(type))
+table(intra)
+table(prefix_bins)
+```
+
+
+---
+
+## Data splitting {-}
+
+To rigorously assess model generalizability to new locations, we implement a spatial hold-out strategy where entire sites are excluded from model training.
+
+```{r}
+
+# CV0 sites. Previously, I said there were a sample of sites removed from window pane.
+#These sites are not going to be used for either training or regular testing, only CV0 testing.
+#Here the sites must be "OX23","LB24","SB24","CL22". 
+set.seed(125)
+out_sites = sample(unique(SNB$site),4,replace = F)|> droplevels();out_sites 
+
+
+# Combine datasets
+SNB_data = left_join(SNB,pre_anthesis_variables, by = c("site" = "SITE")) |> 
+  dplyr::select(-sigma) |> mutate(site=as.factor(site))
+
+# Removing 4 entire sites to CV0 model evaluation
+splits = initial_split(filter(SNB_data, !site %in% out_sites), strata = "sev", prop = 0.85)
+
+# Splitting data into training and test
+SNB_train = training(splits) |> droplevels() # training dataset
+SNB_test =  testing(splits) |> droplevels() # testing dataset
+SNB_test0 = filter(SNB_data, site %in% out_sites) |> droplevels() # CV0 testing dataset
+
+# create resampling procedure for random forest hyperparameter tuning
+kfold = vfold_cv(SNB_train,v=5,strata = "sev")
+
+```
+
+
+# XGBoost Model {.tabset}
+
+## Recipe
+
+```{r xgb-recipe}
+# Preprocessing recipe
+xgb_recipe = 
+  recipe(sev ~ ., data = SNB_train) |>
+  update_role(site, new_role = "ID") |>
+  step_corr(all_numeric_predictors(), threshold = 0.9) |>
+  step_nzv(all_predictors())
+
+xgb_recipe
+```
+
+## Model specification
+
+```{r xgb-spec}
+# Define XGBoost model with hyperparameters to tune
+xgb_spec = boost_tree(
+  trees = 1000,
+  tree_depth = tune(),           # Model complexity
+  min_n = tune(),                # Model complexity
+  loss_reduction = tune(),       # Model complexity
+  sample_size = tune(),          # Randomness
+  mtry = tune(),                 # Randomness
+  learn_rate = tune()            # Step size
+) |>
+  set_engine("xgboost") |>
+  set_mode("regression")
+
+# Create workflow object
+xgb_wf = workflow() |>
+  add_formula(sev ~ .) |>
+  add_model(xgb_spec)
+
+xgb_wf
+```
+
+
+## Hyperparameter tuning
+
+```{r xgb-tune, cache=TRUE}
+# Define hyperparameter grid
+xgb_grid = grid_space_filling(
+  tree_depth(range = c(1, 4)),
+  min_n(),
+  loss_reduction(),
+  sample_size = sample_prop(),
+  finalize(mtry(), SNB_train),
+  learn_rate(),
+  size = 80
+)
+
+summary(xgb_grid)
+
+# Enable parallel processing
+doParallel::registerDoParallel()
+set.seed(125)
+
+# Tune hyperparameters using cross-validation
+xgb_res = tune_grid(
+  xgb_wf,
+  resamples = kfold,
+  grid = xgb_grid,
+  metrics = metric_set(rmse, mae),  
+  control = control_grid(
+    save_pred = TRUE,
+    verbose = FALSE
+  )
+)
+
+# Stop parallel processing
+doParallel::stopImplicitCluster()
+
+# Visualize tuning results
+autoplot(xgb_res) +
+  labs(title = "XGBoost Hyperparameter Tuning Results") +
+  theme_bw()
+
+```
+
+## XGBoost model selection
+
+```{r xgb-finalize}
+# Finalize workflow with best hyperparameters
+final_xgb = finalize_workflow(
+  xgb_wf,
+  select_best(xgb_res, metric = "rmse")
+)
+
+# Fit to training data and evaluate on test set
+final_fit_xgb = last_fit(final_xgb, splits)
+
+final_xgb
+
+collect_metrics(final_fit_xgb)
+```
+
+```{r, echo=FALSE,fig.height=7, fig.width=8}
+extract_workflow(final_fit_xgb) |>
+  extract_fit_parsnip() |>
+  vip(num_features = 20)
+
+ggsave("results/figures/figS6.tiff",width =6,height = 5,units = "in",limitsize = FALSE,dpi = 600)
+
+```
+
+
+## Prediction performance
+
+```{r xgb-predictions, echo=FALSE,fig.width=9, fig.height=3}
+plot_xgboost_predictions(final_fit_xgb$.workflow[[1]],SNB_test0)
+ggsave("results/figures/figS7.tiff",width =9,height = 3,units = "in",limitsize = FALSE,dpi = 600)
+
+```
+
+
+---
+
+
+# Bayesian hierarchical modeling {.tabset}
+
+## Setup {.tabset}
+
+### Data scaling
+
+```{r}
+# Get weather predictors that need to be scaled
+weather_predictors = colnames(SNB_data[grepl("fa", names(SNB_data))])
+
+# Scale data based on entire dataset and not only on training data
+mean_data = colMeans(SNB_data[, weather_predictors], na.rm = TRUE)
+sd_data = apply(SNB_data[, weather_predictors], 2, sd, na.rm = TRUE)
+
+# Scale SNB_train
+SNB_train[, weather_predictors] = scale(SNB_train[, weather_predictors], center = mean_data, scale = sd_data)
+
+# Scale SNB_test
+SNB_test[, weather_predictors] = scale(SNB_test[, weather_predictors], center = mean_data, scale = sd_data)
+
+# Scale SNB_test0
+SNB_test0[, weather_predictors] = scale(SNB_test0[, weather_predictors], center = mean_data, scale = sd_data)
+
+```
+Here we must scale the Weather predictors for training and testing using the entire dataset mean and SD, not just a subset.
+
+### Model settings
+
+```{r}
+chain = 4
+iter = 10000
+warmup = 2000
+cores = 4
+seed = 1234
+control = list(adapt_delta=0.99,max_treedepth=14)
+```
+
+### Environmental relatedness matrix
+
+Note that matrices only contain environments in the training dataset and not in the testing datasets
+
+```{r,fig.width=5,fig.height=5.5,echo=FALSE}
+# Load correlation matix
+load("data/euclimat.Rdata")
+heatmap_plot(euclimat)
+ggsave("results/figures/figS2.tiff",width =5,height = 5.5,units = "in",limitsize = FALSE,dpi = 600)
+```
+
+### Beta regression
+
+The beta distribution is a family of continuous probability distribution defined on the interval \[0, 1\] or (0, 1) in terms of two positive parameters denoted by `alpha` ($\alpha$) and `beta` ($\beta$), that appear as exponents of the variable and its complement to 1 (thus its suitability to model proportions), respectively, and control the shape of the distribution. 
+
+Here is an example to look at the distribution of scores for this test where most people get 6/10, or 60%, we can use 6 and 4 as parameters. Most people score around 60%, and the distribution isn't centered---it's asymmetric.
+
+```{r,echo=FALSE}
+ggplot() +
+  geom_function(fun = dbeta, args = list(shape1 = 6, shape2 = 4),
+                aes(color = "Beta(alpha = 6, beta = 4)"),
+                linewidth = 1) +
+  scale_color_manual(values = harmonious_palette[6]) +
+  theme(legend.position = "bottom")
+```
+
+The magic of---and most confusing part about---beta distributions is that you can get all sorts of curves by just changing the shape parameters. To make this easier to see, we can make a bunch of different beta distributions.
+
+```{r,echo=FALSE}
+ggplot() +
+  geom_function(fun = dbeta, args = list(shape1 =4, shape2 = 50),
+                aes(color = "Beta(alpha = 4, beta = 50)"),
+                linewidth = 1) +
+  geom_function(fun = dbeta, args = list(shape1 = 180, shape2 = 40),
+                aes(color = "Beta(alpha = 180, beta = 40)"),
+                linewidth = 1) +
+  geom_function(fun = dbeta, args = list(shape1 = 9, shape2 = 1),
+                aes(color = "Beta(alpha = 9, beta = 1)"),
+                linewidth = 1) +
+  geom_function(fun = dbeta, args = list(shape1 = 2, shape2= 11),
+                aes(color = "Beta(alpha = 2, beta = 11)"),
+                linewidth = 1) +
+  scale_color_manual(values = harmonious_palette[c(2, 4, 6, 8)], name = "",
+                        guide = guide_legend(nrow = 2)) +
+  theme(legend.position = "bottom")
+```
+
+### Priors
+
+```{r,echo=FALSE}
+# Helper function
+convert_pct_to_logit = function(baseline_pct, increase_pct, increase_sd) {
+  baseline_prop = baseline_pct / 100
+  new_prop = (baseline_pct + increase_pct) / 100
+  
+  # Mean effect
+  mean_logit = qlogis(new_prop) - qlogis(baseline_prop)
+  
+  # SD approximation
+  lower_prop = (baseline_pct + increase_pct - increase_sd) / 100
+  upper_prop = (baseline_pct + increase_pct + increase_sd) / 100
+  
+  lower_logit = qlogis(pmax(0.001, pmin(0.999, lower_prop)))
+  upper_logit = qlogis(pmax(0.001, pmin(0.999, upper_prop)))
+  new_logit = qlogis(new_prop)
+  
+  sd_logit = mean(c(
+    new_logit - lower_logit,
+    upper_logit - new_logit
+  ))
+  
+  return(list(mean = round(mean_logit, 1), sd = round(sd_logit, 1)))
+}
+
+# Apply to all effects
+residue = convert_pct_to_logit(2, 9, 3.7)
+resistance_S = convert_pct_to_logit(2, 7.3, 2.9)
+resistance_MS = convert_pct_to_logit(2, 4, 5.0)
+onset = convert_pct_to_logit(2, 2.5, 5)
+
+# Results
+cat("Residue:", residue$mean, "±", residue$sd, "\n")
+cat("Resistance S:", resistance_S$mean, "±", resistance_S$sd, "\n")
+cat("Resistance MS:", resistance_MS$mean, "±", resistance_MS$sd, "\n")
+cat("Onset:", onset$mean, "±", onset$sd, "\n")
+cat("Intercept:", round(qlogis(0.02), 1), "\n")
+```
+
+Priors for categorical agronomic predictors were derived by converting expected percentage-point effects into their corresponding logit-scale values under a baseline severity of 2% (no residue and MR cultivar). Because the logit transformation is steep near zero, modest absolute changes in severity (for example, 4–10%) map to comparatively large effects on the linear predictor, yielding prior means of 1.2–1.8 for residue and resistance classes. The associated standard deviations (0.3–1.1) reflect the empirical uncertainty around these effects, with wider values producing weaker priors. 
+
+## Model Development {.tabset}
+
+### M1
+
+The simplest model including only agronomic and host factors without accounting for site-specific variation or weather effects.
+
+*Formula:*
+```
+sev ~ residue + snb_onset + resistance
+```
+
+*Key Features:*
+- Fixed effects for crop residue, disease onset timing, and cultivar resistance
+- No random effects or weather variables
+- Establishes baseline prediction performance
+
+```{r}
+M1 = brm(
+  bf(sev ~ residue + snb_onset + resistance),
+  data = SNB_train,
+  family = Beta(link = "logit"),
+  prior = c(
+    set_prior("normal(1.8, 0.4)", class = "b",coef = "residueY"),
+    set_prior("normal(1.6, 0.4)", class = "b",coef = "resistanceS"),
+    set_prior("normal(1.1,1.3)", class = "b",coef = "resistanceMS"),
+    set_prior("normal(0.8, 2.3)", class = "b",coef = "snb_onsetpre_anthesis"),
+    set_prior("normal(-3.9, 5)", class = "Intercept"),
+    set_prior("gamma(2, 0.01)",class = "phi")), 
+  chains = chain,
+  iter = iter,
+  warmup = warmup,
+  cores = cores,
+  seed = seed,
+  control = control,
+  file = "results/models/M1")
+```
+
+```{r,echo=FALSE}
+summary(M1)
+```
+
+```{r,echo=FALSE}
+plot_bayesian_predictions(M1, SNB_test0)
+ggsave("results/figures/M1.tiff",width =9,height = 3,units = "in",limitsize = FALSE,dpi = 600)
+```
+
+::: {.callout-note collapse="true" appearance="minimal"}
+#### Click to view Stan code for M1
+```{r m1-stancode, comment="", class.output="stan"}
+cat(make_stancode(M1))
+```
+:::
+
+::: {.callout-note collapse="true" appearance="minimal"}
+#### Click to view priors for M1
+```{r m1-prior, comment="", class.output="stan"}
+prior_summary(M1)
+```
+:::
+
+
+
+### M2 - Random intercepts
+
+Extends M1 by adding random site-level intercepts to account for unmeasured site-specific factors (e.g., inoculum pressure, microclimate, soil conditions).
+
+*Formula:*
+```
+sev ~ residue + snb_onset + resistance + (1|site)
+```
+
+*Key Features:*
+- Hierarchical structure with site-level random effects
+- Accounts for pseudo-replication within sites
+- Partial pooling of site estimates
+
+```{r}
+M2 = brm(
+  bf(sev ~ residue + snb_onset + resistance + (1|site)),
+  data = SNB_train,
+  family = Beta(link = "logit"),
+  prior = c(
+    set_prior("normal(1.8, 0.4)", class = "b",coef = "residueY"),
+    set_prior("normal(1.6, 0.4)", class = "b",coef = "resistanceS"),
+    set_prior("normal(1.1,1.3)", class = "b",coef = "resistanceMS"),
+    set_prior("normal(0.8, 2.3)", class = "b",coef = "snb_onsetpre_anthesis"),
+    set_prior("normal(-3.9, 5)", class = "Intercept"),
+    set_prior("gamma(2, 0.01)", class = "phi"),
+    set_prior("cauchy(0, 2.5)", class = "sd")
+  ),
+  chains = chain,
+  iter = iter,
+  warmup = warmup,
+  cores = cores,
+  seed = seed,
+  control = control,
+  file = "results/models/M2"
+)
+```
+
+```{r, echo=FALSE}
+summary(M2)
+```
+
+```{r,echo=FALSE}
+plot_bayesian_predictions(M2, SNB_test0)
+ggsave("results/figures/M2.tiff",width =9,height = 3,units = "in",limitsize = FALSE,dpi = 600)
+```
+
+
+::: {.callout-note collapse="true" appearance="minimal"}
+#### Click to view Stan code for M2
+```{r m2-stancode, comment="", class.output="stan"}
+cat(make_stancode(M2))
+```
+:::
+
+
+::: {.callout-note collapse="true" appearance="minimal"}
+#### Click to view priors for M2
+```{r m2-prior, comment="", class.output="stan"}
+prior_summary(M2)
+```
+:::
+
+
+### M3: Environmental similarity
+
+Relaxes the assumption of independence between group-level intercepts by introducing an environmental similarity matrix.
+
+*Formula:*
+```
+sev ~ residue + snb_onset + resistance + (1|gr(site, cov=euclimat))
+```
+
+*Key Features:*
+- Environmental similarity matrix from climate data
+- Improved prediction for held-out sites via information borrowing
+
+```{r}
+M3 = brm(
+  bf(sev ~ residue + snb_onset + resistance + (1|gr(site, cov = euclimat))),
+  data = SNB_train,
+  data2 = list(euclimat = euclimat),
+  family = Beta(link = "logit"),
+  prior = c(
+    set_prior("normal(1.8, 0.4)", class = "b",coef = "residueY"),
+    set_prior("normal(1.6, 0.4)", class = "b",coef = "resistanceS"),
+    set_prior("normal(1.1,1.3)", class = "b",coef = "resistanceMS"),
+    set_prior("normal(0.8, 2.3)", class = "b",coef = "snb_onsetpre_anthesis"),
+    set_prior("normal(-3.9, 5)", class = "Intercept"),
+    set_prior("gamma(2, 0.01)", class = "phi"),
+    set_prior("cauchy(0, 2.5)", class = "sd")
+  ),
+  chains = chain,
+  iter = iter,
+  warmup = warmup,
+  cores = cores,
+  seed = seed,
+  control = control,
+  file = "results/models/M3"
+)
+```
+
+```{r, echo=FALSE}
+summary(M3)
+```
+
+```{r, echo=FALSE}
+plot_bayesian_predictions(M3, SNB_test0)
+ggsave("results/figures/M3.tiff", width = 9, height = 3, units = "in", limitsize = FALSE,dpi = 600)
+```
+
+::: {.callout-note collapse="true" appearance="minimal"}
+#### Click to view Stan code for M3
+```{r m3-stancode, comment="", class.output="stan"}
+cat(make_stancode(M3))
+```
+:::
+
+::: {.callout-note collapse="true" appearance="minimal"}
+#### Click to view priors for M3
+```{r m3-prior, comment="", class.output="stan"}
+prior_summary(M3)
+```
+:::
+
+
+### M4: Selected weather predictors
+
+Introduces six selected pre-anthesis weather variables identified through variable selection procedures. Uses hierarchical structure to separate agronomic and weather effects.
+
+*Formula Structure:*
+```
+sev ~ agronomic + weather
+  agronomic ~ residue + resistance + snb_onset
+  weather ~ [6 selected variables] + (1|site)
+```
+
+```{r}
+selected_pre_anthesis_predictors = c(
+  "fa1.77_71.RH.G90.dusk.sum_14",
+  "fa1.66_58.R.0.6.rl.count2.daytime.sum_28",
+  "fa1.61_55.T.16T19.daytime.sum_28",
+  "fa1.47_38.TRH.7T10nRH.G85.dawn.sum_14",
+  "fa1.20_6.TR.19T22nR.G.0.2.daytime.sum_28",
+  "fa1.14_7.TR.13T16nR.G.0.2.dawn.sum_21"
+)
+
+weather_formula = as.formula(
+  paste("weather ~ 0 +", paste(selected_pre_anthesis_predictors, collapse = " + "), "+ (1|site)"))
+
+M4 = brm(
+  bf(sev ~ agronomic + weather, nl = TRUE) +
+    lf(agronomic ~ residue + resistance + snb_onset, center = TRUE) +
+    lf(weather_formula, cmc = FALSE),
+  data = SNB_train,
+  family = Beta(link = "logit"),
+  prior = c(
+    set_prior("normal(1.8, 0.4)", class = "b",coef = "residueY", nlpar = "agronomic"),
+    set_prior("normal(1.6, 0.4)", class = "b",coef = "resistanceS", nlpar = "agronomic"),
+    set_prior("normal(1.1,1.3)", class = "b",coef = "resistanceMS", nlpar = "agronomic"),
+    set_prior("normal(0.8, 2.3)", class = "b",coef = "snb_onsetpre_anthesis", nlpar = "agronomic"),
+    set_prior("normal(-3.9, 5)", nlpar = "agronomic", class = "Intercept"),
+    set_prior("normal(0, 100)", class = "b", nlpar = "weather"),
+    set_prior("gamma(2, 0.01)", class = "phi"),
+    set_prior("cauchy(0, 2.5)", class = "sd", nlpar = "weather")
+  ),
+  chains = chain,
+  iter = iter,
+  warmup = warmup,
+  cores = cores,
+  seed = seed,
+  control = control,
+  file = "results/models/M4"
+)
+
+```
+
+```{r, echo=FALSE}
+summary(M4)
+```
+
+```{r , echo=FALSE}
+plot_bayesian_predictions(M4, SNB_test0)
+ggsave("results/figures/M4.tiff", width = 9, height = 3, units = "in", limitsize = FALSE,dpi = 600)
+```
+
+::: {.callout-note collapse="true" appearance="minimal"}
+#### Click to view Stan code for M4
+```{r m4-stancode, comment="", class.output="stan"}
+cat(make_stancode(M4))
+```
+:::
+
+
+::: {.callout-note collapse="true" appearance="minimal"}
+#### Click to view priors for M4
+```{r m4-prior, comment="", class.output="stan"}
+prior_summary(M4)
+```
+:::
+
+
+### M5: Six weather predictors + environmental similarity 
+
+Combines the selected weather predictors from M4 with the environmental similarity structure from M3.
+
+*Formula Structure:*
+
+```
+sev ~ agronomic + weather
+  agronomic ~ residue + resistance + snb_onset
+  weather ~ [6 selected variables] + (1|gr(site, cov=euclimat))
+```
+
+```{r}
+weather_formulac = as.formula(
+  paste("weather ~ 0 +", paste(selected_pre_anthesis_predictors, collapse = " + "), "+ (1|gr(site,cov=euclimat))"))
+
+
+M5 = brm(
+  bf(sev ~ agronomic + weather, nl = TRUE) +
+    lf(agronomic ~ residue + resistance + snb_onset, center = TRUE) +
+    lf(weather_formulac, cmc = FALSE),
+  data = SNB_train,
+  data2 = list(euclimat = euclimat),
+  family = Beta(link = "logit"),
+  prior = c(
+    set_prior("normal(1.8, 0.4)", class = "b",coef = "residueY", nlpar = "agronomic"),
+    set_prior("normal(1.6, 0.4)", class = "b",coef = "resistanceS", nlpar = "agronomic"),
+    set_prior("normal(1.1,1.3)", class = "b",coef = "resistanceMS", nlpar = "agronomic"),
+    set_prior("normal(0.8, 2.3)", class = "b",coef = "snb_onsetpre_anthesis", nlpar = "agronomic"),
+    set_prior("normal(-3.9, 5)", nlpar = "agronomic", class = "Intercept"),
+    set_prior("normal(0, 100)", class = "b", nlpar = "weather"),
+    set_prior("gamma(2, 0.01)", class = "phi"),
+    set_prior("cauchy(0, 2.5)", class = "sd", nlpar = "weather")
+  ),
+  chains = chain,
+  iter = iter,
+  warmup = warmup,
+  cores = cores,
+  seed = seed,
+  control = control,
+  file = "results/models/M5"
+)
+```
+
+```{r, echo=FALSE}
+summary(M5)
+```
+
+```{r, echo=FALSE}
+plot_bayesian_predictions(M5, SNB_test0)
+ggsave("results/figures/M5.tiff", width = 9, height = 3, units = "in", limitsize = FALSE,dpi = 600)
+```
+
+::: {.callout-note collapse="true" appearance="minimal"}
+#### Click to view Stan code for M5
+```{r m5-stancode, comment="", class.output="stan"}
+cat(make_stancode(M5))
+```
+:::
+
+::: {.callout-note collapse="true" appearance="minimal"}
+#### Click to view priors for M5
+```{r m5-prior, comment="", class.output="stan"}
+prior_summary(M5)
+```
+:::
+
+
+### M6: Six weather predictors regularized with R2D2 prior + environmental similarity 
+
+Introduces the R2D2 prior for automatic variable selection and regularization of weather effects.
+
+*Formula Structure:*
+```
+sev ~ agronomic + weather
+  agronomic ~ residue + resistance + snb_onset
+  weather ~ [6 selected variables] + (1|gr(site, cov=euclimat))
+  [R2D2 prior on weather effects]
+```
+
+```{r}
+M6 = brm(
+  bf(sev ~ agronomic + weather, nl = TRUE) +
+    lf(agronomic ~ residue + resistance + snb_onset, center = TRUE) +
+    lf(weather_formulac, cmc = FALSE),
+  data = SNB_train,
+  data2 = list(euclimat = euclimat),
+  family = Beta(link = "logit"),
+  prior = c(
+    set_prior("normal(1.8, 0.4)", class = "b",coef = "residueY", nlpar = "agronomic"),
+    set_prior("normal(1.6, 0.4)", class = "b",coef = "resistanceS", nlpar = "agronomic"),
+    set_prior("normal(1.1,1.3)", class = "b",coef = "resistanceMS", nlpar = "agronomic"),
+    set_prior("normal(0.8, 2.3)", class = "b",coef = "snb_onsetpre_anthesis", nlpar = "agronomic"),
+    set_prior("normal(-3.9, 5)", nlpar = "agronomic", class = "Intercept"),
+    set_prior("R2D2(mean_R2 = 0.8, prec_R2 = 10, cons_D2 = 0.5)", class = "b", nlpar = "weather"),
+    set_prior("gamma(2, 0.01)", class = "phi"),
+    set_prior("cauchy(0, 2.5)", class = "sd", nlpar = "weather")
+  ),
+  chains = chain,
+  iter = iter,
+  warmup = warmup,
+  cores = cores,
+  seed = seed,
+  control = control,
+  file = "results/models/M6"
+)
+
+```
+
+```{r , echo=FALSE}
+summary(M6)
+```
+
+```{r , echo=FALSE}
+plot_bayesian_predictions(M6, SNB_test0)
+ggsave("results/figures/M6.tiff", width = 9, height = 3, units = "in", limitsize = FALSE,dpi = 600)
+```
+
+::: {.callout-note collapse="true" appearance="minimal"}
+#### Click to view Stan code for M6
+```{r m6-stancode, comment="", class.output="stan"}
+cat(make_stancode(M6))
+```
+:::
+
+::: {.callout-note collapse="true" appearance="minimal"}
+#### Click to view priors for M6
+```{r m6-prior, comment="", class.output="stan"}
+prior_summary(M6)
+```
+:::
+
+
+### M7: 42 *fa1* weather predictors regularized with R2D2 prior 
+
+Expands to the complete FA1 (first factor analysis component) weather library with R2D2 regularization.
+
+*Formula Structure:*
+
+```
+sev ~ agronomic + rest
+  agronomic ~ residue + resistance + snb_onset
+  rest ~ [all FA1 variables] + (1|site)
+  [R2D2 prior on weather effects]
+```
+
+```{r}
+fa1_formula = as.formula(
+  paste("rest ~ 0 +", paste(grep("^fa1", names(pre_anthesis_variables), value = TRUE), collapse = " + "), "+ (1|site)"))
+
+M7 = brm(
+  bf(sev ~ agronomic + rest, nl = TRUE) +
+    lf(agronomic ~ residue + resistance + snb_onset, center = TRUE) +
+    lf(fa1_formula, cmc = FALSE),
+  data = SNB_train,
+  family = Beta(link = "logit"),
+  prior = c(
+    set_prior("normal(1.8, 0.4)", class = "b",coef = "residueY", nlpar = "agronomic"),
+    set_prior("normal(1.6, 0.4)", class = "b",coef = "resistanceS", nlpar = "agronomic"),
+    set_prior("normal(1.1,1.3)", class = "b",coef = "resistanceMS", nlpar = "agronomic"),
+    set_prior("normal(0.8, 2.3)", class = "b",coef = "snb_onsetpre_anthesis", nlpar = "agronomic"),
+    set_prior("normal(-3.9, 5)", nlpar = "agronomic", class = "Intercept"),
+    set_prior("R2D2(mean_R2 = 0.8, prec_R2 = 10, cons_D2 = 0.5)", class = "b", nlpar = "rest"),
+    set_prior("gamma(2, 0.01)", class = "phi"),
+    set_prior("cauchy(0, 2.5)", class = "sd", nlpar = "rest")
+  ),
+  chains = chain,
+  iter = iter,
+  warmup = warmup,
+  cores = cores,
+  seed = seed,
+  control = control,
+  file = "results/models/M7"
+)
+
+```
+
+```{r, echo=FALSE}
+summary(M7)
+```
+
+```{r, echo=FALSE}
+plot_bayesian_predictions(M7, SNB_test0)
+ggsave("results/figures/fig1.tiff", width = 9, height = 3, units = "in", limitsize = FALSE,dpi = 600)
+```
+
+::: {.callout-note collapse="true" appearance="minimal"}
+#### Click to view Stan code for M7
+```{r m7-stancode, comment="", class.output="stan"}
+cat(make_stancode(M7))
+```
+:::
+
+::: {.callout-note collapse="true" appearance="minimal"}
+#### Click to view priors for M7
+```{r m7-prior, comment="", class.output="stan"}
+prior_summary(M7)
+```
+:::
+
+### M8: Regional dispersion
+
+Extends M7 by modeling heterogeneous dispersion (phi parameter) across regions.
+
+*Formula Structure:*
+
+```
+sev ~ agronomic + rest
+phi ~ 0 + region
+  agronomic ~ residue + resistance + snb_onset
+  rest ~ [all FA1 variables] + (1|site)
+```
+
+```{r}
+M8 = brm(
+  bf(
+    sev ~ agronomic + rest,
+    phi ~ 0 + region,
+    nl = TRUE
+  ) +
+    lf(agronomic ~ residue + resistance + snb_onset, center = TRUE) +
+    lf(fa1_formula, cmc = FALSE),
+  data = SNB_train,
+  family = Beta(link = "logit", link_phi = "log"),
+  prior = c(
+    set_prior("normal(1.8, 0.4)", class = "b",coef = "residueY", nlpar = "agronomic"),
+    set_prior("normal(1.6, 0.4)", class = "b",coef = "resistanceS", nlpar = "agronomic"),
+    set_prior("normal(1.1,1.3)", class = "b",coef = "resistanceMS", nlpar = "agronomic"),
+    set_prior("normal(0.8, 2.3)", class = "b",coef = "snb_onsetpre_anthesis", nlpar = "agronomic"),
+    set_prior("normal(-3.9, 5)", nlpar = "agronomic", class = "Intercept"),
+    set_prior("R2D2(mean_R2 = 0.8, prec_R2 = 10, cons_D2 = 0.5)", class = "b", nlpar = "rest"),
+    set_prior("cauchy(0, 2.5)", class = "sd", nlpar = "rest")
+  ),
+  chains = chain,
+  iter = iter,
+  warmup = warmup,
+  cores = cores,
+  seed = seed,
+  control = control,
+  file = "results/models/M8"
+)
+```
+
+```{r , echo=FALSE}
+summary(M8)
+```
+
+```{r , echo=FALSE}
+plot_bayesian_predictions(M8, SNB_test0)
+ggsave("results/figures/M8.tiff", width = 9, height = 3, units = "in", limitsize = FALSE,dpi = 600)
+```
+
+::: {.callout-note collapse="true" appearance="minimal"}
+#### Click to view Stan code for M8
+```{r m8-stancode, comment="", class.output="stan"}
+cat(make_stancode(M8))
+```
+:::
+
+::: {.callout-note collapse="true" appearance="minimal"}
+#### Click to view priors for M8
+```{r m8-prior, comment="", class.output="stan"}
+prior_summary(M8)
+```
+:::
+
+
+### M9: 117 *fa1*, *fa2*, and *fa3* weather predictors regularized with R2D2 prior 
+
+The most comprehensive model including all factor analysis-derived weather variables with R2D2 regularization.
+
+*Formula Structure:*
+```
+sev ~ agronomic + rest
+  agronomic ~ residue + resistance + snb_onset
+  rest ~ [all FA variables] + (1|site)
+  [R2D2 prior on weather effects]
+```
+
+```{r}
+full_formula = as.formula(
+  paste("rest ~ 0 +", paste(grep("^fa", names(pre_anthesis_variables), value = TRUE), collapse = " + "), "+ (1|site)")
+)
+
+M9 = brm(
+  bf(sev ~ agronomic + rest, nl = TRUE) +
+    lf(agronomic ~ residue + resistance + snb_onset, center = TRUE) +
+    lf(full_formula, cmc = FALSE),
+  data = SNB_train,
+  family = Beta(link = "logit"),
+  prior = c(
+    set_prior("normal(1.8, 0.4)", class = "b",coef = "residueY", nlpar = "agronomic"),
+    set_prior("normal(1.6, 0.4)", class = "b",coef = "resistanceS", nlpar = "agronomic"),
+    set_prior("normal(1.1,1.3)", class = "b",coef = "resistanceMS", nlpar = "agronomic"),
+    set_prior("normal(0.8, 2.3)", class = "b",coef = "snb_onsetpre_anthesis", nlpar = "agronomic"),
+    set_prior("normal(-3.9, 5)", nlpar = "agronomic", class = "Intercept"),
+    set_prior("R2D2(mean_R2 = 0.8, prec_R2 = 10, cons_D2 = 0.5)", class = "b", nlpar = "rest"),
+    set_prior("gamma(2, 0.01)", class = "phi"),
+    set_prior("cauchy(0, 2.5)", class = "sd", nlpar = "rest")
+  ),
+  chains = chain,
+  iter = iter,
+  warmup = warmup,
+  cores = cores,
+  seed = seed,
+  control = control,
+  file = "results/models/M9"
+)
+```
+
+```{r, echo=FALSE}
+summary(M9)
+```
+
+```{r , echo=FALSE}
+plot_bayesian_predictions(M9, SNB_test0)
+ggsave("results/figures/M9.tiff", width = 9, height = 3, units = "in", limitsize = FALSE,dpi = 600)
+```
+
+::: {.callout-note collapse="true" appearance="minimal"}
+#### Click to view Stan code for M9
+```{r m9-stancode, comment="", class.output="stan"}
+cat(make_stancode(M9))
+```
+:::
+
+
+::: {.callout-note collapse="true" appearance="minimal"}
+#### Click to view priors for M9
+```{r m9-prior, comment="", class.output="stan"}
+prior_summary(M9)
+```
+:::
+
+
+## Model comparison {-}
+
+
+### CV0 Performance
+
+We evaluate all models using 5-fold cross-validation on the held-out test sites (CV0). This provides a rigorous assessment of model generalizability to new locations.
+
+```{r,echo=FALSE}
+n_folds = 5
+set.seed(125)  
+folds = createFolds(1:nrow(SNB_test0), k = n_folds, list = TRUE, returnTrain = FALSE)
+
+# Initialize results data frame
+results_bayes = data.frame(
+  Model = character(),
+  Fold = integer(),
+  RMSE = numeric(),
+  MAE = numeric(),
+  PICP = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# List of all Bayesian models
+models = list(
+  M1 = M1,
+  M2 = M2,
+  M3 = M3,
+  M4 = M4,
+  M5 = M5,
+  M6 = M6,
+  M7 = M7,
+  M8 = M8,
+  M9 = M9
+)
+
+
+### Bayesian models
+
+for (m in 1:length(models)) {
+  for (i in 1:n_folds) {
+  
+  test_indices = folds[[i]]
+  test_data = SNB_test0[test_indices, ] 
+  
+  predictions = predict_bayes(test_data, models[[m]])  
+  
+  test_results = cbind(test_data, predictions)  
+  
+  metrics = calculate_metrics_bayes(
+    data = test_results, 
+    pred_col = "model_bayes_pred", 
+    true_col = "sev", 
+    ci_lower = "model_bayes_Q2.5", 
+    ci_upper = "model_bayes_Q97.5"
+  )
+
+  fold_results = data.frame(
+    Model = paste0("M",m),
+    Fold = i, 
+    RMSE = metrics$RMSE*100, 
+    MAE = metrics$MAE*100, 
+    PICP = metrics$PICP*100
+  )
+  results_bayes = rbind(results_bayes, fold_results)
+  }
+}
+
+### XGBoost model
+results_xgboost = data.frame(Fold = integer(), RMSE = numeric(), MAE = numeric())
+
+ for (i in 1:n_folds) {
+  
+  test_indices = folds[[i]]
+  test_data = SNB_test0[test_indices, ] 
+  
+  predictions = predict_xgboost(test_data,final_fit_xgb$.workflow[[1]])  
+
+  fold_results = data.frame(
+    Model = "XGBoost",
+    Fold = i, 
+    RMSE = predictions$rmse * 100, 
+    MAE = predictions$mae * 100,
+    PICP = NA
+  )
+  results_xgboost = rbind(results_xgboost, fold_results)
+  }
+
+
+# Summarize results across all models
+summary_metrics = rbind(results_bayes,results_xgboost) |>
+  group_by(Model) |>
+  summarise(
+    Mean_RMSE = mean(RMSE, na.rm = TRUE), 
+    SE_RMSE = sd(RMSE, na.rm = TRUE) / sqrt(n_folds), 
+    Mean_MAE = mean(MAE, na.rm = TRUE), 
+    SE_MAE = sd(MAE, na.rm = TRUE) / sqrt(n_folds), 
+    Mean_PICP = mean(PICP, na.rm = TRUE), 
+    SE_PIPC = sd(PICP, na.rm = TRUE) / sqrt(n_folds)
+  )
+
+summary_metrics
+
+write.csv(summary_metrics,"results/summary_metrics.csv")
+  
+```
+
+### Leave-One-Out Cross-Validation
+
+
+Leave-One-Out Cross-Validation (LOO-CV) provides an information-theoretic comparison of models based on their expected predictive performance. Models are ranked by expected log pointwise predictive density (ELPD).
+
+
+```{r}
+# Fit Models for LOO Comparison 
+
+fit_M1 = add_criterion(M1, "loo")
+fit_M2 = add_criterion(M2, "loo")
+fit_M3 = add_criterion(M3, "loo")
+fit_M4 = add_criterion(M4, "loo")
+fit_M5 = add_criterion(M5, "loo")
+fit_M6 = add_criterion(M6, "loo")
+fit_M7 = add_criterion(M7, "loo")
+fit_M8 = add_criterion(M8, "loo")
+fit_M9 = add_criterion(M9, "loo")
+
+
+# LOO Comparison
+lootest = loo_compare(fit_M1,
+                      fit_M2,
+                      fit_M3,
+                      fit_M4,
+                      fit_M5,
+                      fit_M6,
+                      fit_M7,
+                      fit_M8,
+                      fit_M9,
+                      criterion = "loo", 
+                      model_names = NULL)
+
+
+lootest
+
+```
+
+
+### Model Diagnostics
+
+```{r,echo=FALSE}
+rm(M1, M2, M3, M4, M5, M6, M8, M9)
+rm(fit_M1, fit_M2, fit_M3, fit_M4, fit_M5, fit_M6, fit_M8, fit_M9)
+gc()
+
+pp_check(M7,ndraws = 500)
+plot(M7)
+
+```
+
+---
+
+# Results: Management and Host Factors {.tabset}
+
+## Wheat residue
+
+### Conditional predictions
+
+```{r,echo=FALSE}
+
+conditional_preds = predictions(
+  M7, 
+  newdata = datagrid(residue = c("N", "Y")), 
+  by = "residue", 
+  re_formula = NA,
+  allow_new_levels = TRUE,
+  sample_new_levels = "uncertainty"
+) 
+
+conditional_preds |> 
+  tidy()
+
+res=conditional_preds |> posterior_draws() |>
+  ggplot(aes(x = draw*100, fill = factor(residue))) +
+  stat_halfeye(alpha=0.7, slab_color = "white", slab_linewidth = 0.5) +
+  scale_fill_manual(values = harmonious_palette[c(4, 3)], 
+                    name = "Wheat residue", 
+                    labels = c("Absent", "Present")) +
+  labs(x="SNB severity (%)", y = "Density", fill = "Wheat residue") +
+  coord_cartesian(xlim = c(0, 11.5)) +
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 10),  
+        legend.title = element_text(size = 10))
+
+rm(conditional_preds)
+```
+
+### Marginal effects
+
+```{r,echo=FALSE}
+
+grand_effect_residue = avg_comparisons(
+  M7,
+  variables = list("residue" = "pairwise"), 
+  re_formula = NA,
+  allow_new_levels = TRUE,
+  sample_new_levels = "uncertainty") 
+
+grand_effect_residue |> 
+    tidy()
+
+effect_residue =
+  grand_effect_residue |>
+  posterior_draws() |>
+  group_by(drawid) |>
+  summarize(draw = mean(draw),.groups = "drop") |>
+  ggplot(aes(x = draw * 100)) +
+  stat_halfeye(alpha=0.7) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(x = "Marginal effect (%)", y = "Density") +
+  coord_cartesian(xlim = c(-0.5, 13)) +
+  theme(legend.position = "bottom")
+
+rm(grand_effect_residue)
+
+```
+
+## Cultivar reaction class
+
+### Conditional predictions
+
+```{r,echo=FALSE}
+
+conditional_preds = predictions(
+  M7, 
+  newdata = datagrid(resistance = c("MR", "MS", "S")), 
+  by = "resistance", 
+  re_formula = NA,
+  allow_new_levels = TRUE,
+  sample_new_levels = "uncertainty"
+) 
+
+conditional_preds |> 
+  tidy()
+
+resist=conditional_preds |> posterior_draws()  |> 
+  ggplot(aes(x = draw*100, fill = factor(resistance))) +
+  stat_halfeye(alpha=0.7,slab_color = "white", slab_linewidth = 0.5) +
+  scale_fill_manual(values = harmonious_palette[c(13,5,6)],name = "SNB resistance class")+
+    labs(x="SNB severity (%)", y = "Density") +
+  coord_cartesian(xlim = c(3, 20)) +
+    theme(legend.position = "bottom") +
+  theme(
+    legend.text = element_text(size = 10),  
+    legend.title = element_text(size = 10))
+
+rm(conditional_preds)
+
+```
+
+### Marginal effects
+
+```{r,echo=FALSE}
+
+grand_effect_resis = avg_comparisons(
+  M7,
+  variables = list("resistance" = "pairwise"),
+  re_formula = NA,
+  allow_new_levels = TRUE,
+  sample_new_levels = "uncertainty") 
+
+grand_effect_resis |> 
+    tidy()
+
+effect_resis =
+  grand_effect_resis |>
+  posterior_draws() |>
+  group_by(drawid, contrast) |>
+  summarize(draw = mean(draw), .groups = "drop") |>
+  ggplot(aes(x = draw * 100)) +
+  tidybayes::stat_halfeye(alpha = 0.6) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(x = "Marginal effect (%)", y = "Density") +
+  coord_cartesian(xlim = c(0, 9)) +
+  facet_wrap(
+    ~ contrast,
+    nrow = 3,
+    labeller = labeller(
+      contrast = c(
+        "mean(MS) - mean(MR)" = "MS - MR",
+        "mean(S) - mean(MR)" = "S - MR",
+        "mean(S) - mean(MS)" = "S - MS"
+      )
+    )
+  ) +
+  theme_bw(base_size = 10)
+
+rm(grand_effect_resis)
+```
+
+
+## Disease onset timing
+
+### Conditional predictions
+
+```{r,echo=FALSE}
+
+conditional_preds = predictions(
+  M7, 
+  newdata = datagrid(snb_onset = c("pre_anthesis","post_anthesis")), 
+  by = "snb_onset", 
+  re_formula = NA,
+  allow_new_levels = TRUE,
+  sample_new_levels = "uncertainty"
+) 
+
+conditional_preds |> 
+  tidy()
+
+
+time=conditional_preds |> posterior_draws() |>
+  ggplot(aes(x = draw*100, fill = factor(snb_onset))) +
+   stat_halfeye(alpha=0.7,slab_color = "white", slab_linewidth = 0.5) +
+    scale_fill_manual(values = harmonious_palette[c(8, 12)],name = "Disease onset",labels = c("Pre-anthesis","Post-anthesis"))+
+    labs(x="SNB severity (%)", y = "Density", fill = "Disease onset") +
+  coord_cartesian(xlim = c(3.5, 11)) +
+    theme(legend.position = "bottom")+
+  theme(
+    legend.text = element_text(size = 10),  
+    legend.title = element_text(size = 10))
+
+rm(conditional_preds)
+
+```
+
+### Marginal effects
+
+```{r,echo=FALSE}
+
+grand_effect_time = avg_comparisons(
+  M7,
+  variables = list("snb_onset" = "pairwise"),
+  re_formula = NA,
+  allow_new_levels = TRUE,
+  sample_new_levels = "uncertainty") 
+
+grand_effect_time |> 
+    tidy()
+
+
+effect_time = grand_effect_time |> posterior_draws() |>  
+  group_by(drawid) |> 
+  summarize(draw = mean(draw),.groups = "drop") |>
+  ggplot(aes(x = draw*100)) +
+    stat_halfeye(alpha=0.7) +
+    geom_vline(xintercept = 0,linetype="dashed") +
+    labs(x="Marginal effect (%)", y = "Density") +
+  coord_cartesian(xlim = c(-3, 4.5)) +
+    theme(legend.position = "bottom") 
+
+rm(grand_effect_time)
+```
+
+
+
+```{r, fig.height=13, fig.width=8,echo=FALSE}
+combined_plot = (res + effect_residue) /(resist + effect_resis)   / (time + effect_time) + plot_annotation(tag_levels = 'A') & theme(text = element_text(size = 14)) 
+
+combined_plot
+
+ggsave("results/figures/fig3.tiff",width =8,height = 13,units = "in",limitsize = FALSE,dpi = 600)
+
+```
+
+---
+
+# Results: Site effects {.tabset}
+
+## Site-Level random intercepts {-}
+
+```{r, echo=FALSE}
+res = M7 |>
+  spread_draws(b_agronomic_Intercept, r_site__rest[site, ]) |>
+  mutate(
+    mu = b_agronomic_Intercept + r_site__rest,
+    site = str_replace_all(site, "[.]", " ")
+  ) |>
+  ungroup()
+
+# Calculate global mean and credible intervals
+global_mu = mean(res$mu)
+fixed_intercept = fixef(M7)[1, "Estimate"]
+ci_lower = fixef(M7)[1, "Q2.5"]
+ci_upper = fixef(M7)[1, "Q97.5"]
+
+res |>
+  ggplot(aes(x = mu, y = reorder(site, mu))) +
+  stat_halfeye(
+    .width = c(0.80, 0.95),
+    alpha = 0.7,
+    slab_color = "white",
+    slab_linewidth = 0.5,
+    point_interval = "median_qi"
+  ) +
+  geom_vline(
+    xintercept = global_mu,
+    linetype = "solid",
+    linewidth = 0.8,
+    color = "black",
+    alpha = 0.8
+  ) +
+  geom_vline(
+    xintercept = ci_lower,
+    linetype = "dashed",
+    color = "black",
+    linewidth = 0.6,
+    alpha = 0.6
+  ) +
+  geom_vline(
+    xintercept = ci_upper,
+    linetype = "dashed",
+    color = "black",
+    linewidth = 0.6,
+    alpha = 0.6
+  ) +
+  labs(
+    x = "Random Intercept (logit scale)",
+    y = "Training Sites") +
+  xlim(-5.5,-3.2) +
+  theme(panel.grid = element_blank(),
+        axis.ticks.y = element_blank()) 
+
+res |>
+  group_by(site) |>
+  summarize(
+    median = median(mu),
+    mean = mean(mu),
+    sd = sd(mu),
+    q025 = quantile(mu, 0.025),
+    q975 = quantile(mu, 0.975),
+    .groups = "drop"
+  ) |>
+  arrange(desc(median))
+
+
+ggsave("results/figures/figS3.tiff",width =6.5,height = 7.5,units = "in",limitsize = FALSE,dpi = 600)
+
+```
+Sites with positive deviations experienced systematically higher disease severity after accounting for weather and management factors, suggesting persistent local conditions favoring disease (e.g., high background inoculum, favorable microclimate).
+
+
+# Results: Weather effects {.tabset}
+
+## Weather variable summary {-}
+
+```{r, echo=FALSE}
+# Extract and process fixed effects for weather variables
+coefficients = summary(M7)$fixed |>
+  as.data.frame() |>
+  rownames_to_column("variable") |>
+  as_tibble() |>
+  rename_with(tolower) |>
+  mutate(variable = str_remove(variable, "^rest_")) |>
+  filter(str_detect(variable, "^fa")) |>
+  mutate(
+    abs_estimate = abs(estimate),
+    
+    # Extract timing information
+    doy_start = as.numeric(str_extract(variable, "\\d+(?=_)")),
+    doy_end = as.numeric(str_extract(variable, "(?<=_)\\d+(?=\\.)")),
+    doy_window = doy_start - doy_end,
+    
+    # Create time bins
+    doy_bins = cut(
+      doy_start,
+      breaks = seq(0, 100, by = 10),
+      right = FALSE,
+      include.lowest = TRUE,
+      labels = sprintf("%d-%d", seq(0, 90, 10), seq(9, 99, 10))
+    ),
+    
+    # Classify variable types
+    var_type = case_when(
+      str_detect(variable, "\\.TRH\\.")         ~ "TRH",
+      str_detect(variable, "\\.TR\\.")          ~ "TR",
+      str_detect(variable, "\\.RH\\.")          ~ "RH",
+      str_detect(variable, "\\.T\\.")           ~ "T",
+      str_detect(variable, "\\.T8\\.")          ~ "T",
+      str_detect(variable, "\\.R\\.")           ~ "R",
+      str_detect(variable, "\\.RH8\\.")         ~ "R",
+      str_detect(variable, "\\.ETo\\.")         ~ "ETo"
+    ),
+    var_type = factor(var_type, levels = c(
+      "TRH", "TR", "RH",
+      "T", "R", "ETo"
+    )),
+    
+    # Extract time of day
+    time_of_day = case_when(
+      str_detect(variable, "\\.nighttime\\.") ~ "Nighttime",
+      str_detect(variable, "\\.daytime\\.")   ~ "Daytime",
+      str_detect(variable, "\\.dawn\\.")      ~ "Dawn",
+      str_detect(variable, "\\.dusk\\.")      ~ "Dusk",
+      str_detect(variable, "\\.24h\\.")       ~ "24-hour"
+    ),
+    time_of_day = factor(time_of_day, levels = c(
+      "Dawn", "Daytime", "Dusk", "Nighttime", "24-hour"
+    )),
+    
+    # Effect direction
+    direction = case_when(
+      estimate > 0 ~ "Positive",
+      estimate < 0 ~ "Negative"
+    ),
+    direction = factor(direction, levels = c("Positive", "Negative")),
+    
+    # Create short variable name for plotting
+    variable_short = str_extract(variable, "fa1\\.\\d+_\\d+\\.[^.]+\\.[^.]+")
+  ) |>
+  arrange(desc(abs_estimate))
+
+# Display summary statistics
+cat("Total weather variables:", nrow(coefficients), "\n")
+print(table(coefficients$var_type))
+print(table(coefficients$time_of_day))
+print(table(coefficients$direction))
+```
+
+
+```{r, echo=FALSE}
+coefficients |>
+  slice_head(n = 10) |>
+  mutate(
+    `Coefficient (95% CI)` = sprintf("%.3f [%.3f, %.3f]", estimate, `l-95% ci`, `u-95% ci`),
+    `Days Before Anthesis` = sprintf("%d-%d", doy_start, doy_end),
+    `|Effect|` = round(abs_estimate, 3)
+  ) |>
+  select(
+    Variable = variable,
+    Type = var_type,
+    `Time of Day` = time_of_day,
+    `Days Before Anthesis`,
+    `Coefficient (95% CI)`,
+    Direction = direction
+  )
+```
+
+```{r, echo=FALSE, fig.width=7, fig.height=9}
+coefficients |>
+  arrange(desc(abs_estimate)) |>
+  ggplot(aes(x = estimate, y = reorder(variable, abs_estimate))) +
+  geom_vline(
+    xintercept = 0,
+    linetype = "dashed",
+    color = "black",
+    linewidth = 0.8,
+    alpha = 0.5
+  ) +
+  geom_linerange(
+    aes(xmin = `l-95% ci`, xmax = `u-95% ci`, color = doy_start),
+    alpha = 0.5,
+    linewidth = 1
+  ) +
+  geom_point(
+    aes(color = doy_start, size = abs_estimate),
+    alpha = 0.8
+  ) +
+  facet_grid(var_type ~ ., scales = "free_y", space = "free_y") +
+  scale_color_gradientn(
+    colors = harmonious_palette[c(10,6)],
+    name = "Start LAG"
+  ) +
+  scale_size_continuous(
+    range = c(1, 5),
+    name = "|Effect size|"
+  ) +
+  labs(
+    x = "Coefficient Estimate (95% CI)",
+    y = NULL
+  )+
+  theme(
+    axis.text.y = element_text(size = 8, face = "italic"),
+    legend.position = "right",
+    panel.grid.major.x = element_line(color = "grey90"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_line(color = "grey95", linewidth = 0.3)
+  )
+
+ggsave("results/figures/fig4.tiff",width = 7,height = 8.5,units = "in",dpi = 600)
+
+
+write.csv(coefficients, "results/weather_coefficients.csv", row.names = FALSE)
+```
+
+## Marginal effects of key variables {-}
+
+```{r,echo=FALSE}
+### fa1.20_7.TRH.13T16nRH.G85.daytime.sum_14
+
+# Create a sequence of values for the specified weather term
+grida = seq(min(SNB_train$fa1.20_7.TRH.13T16nRH.G85.daytime.sum_14), 
+             max(SNB_train$fa1.20_7.TRH.13T16nRH.G85.daytime.sum_14), by = 0.1)
+
+# Generate predictions
+pred_res = predictions(
+  model = M7,
+  newdata = datagrid(fa1.20_7.TRH.13T16nRH.G85.daytime.sum_14= grida),
+  by = "fa1.20_7.TRH.13T16nRH.G85.daytime.sum_14",
+  re_formula = NA,
+  allow_new_levels = TRUE,
+  sample_new_levels = "uncertainty"
+)
+
+one = pred_res  |>
+  posterior_draws() |>  
+  group_by(fa1.20_7.TRH.13T16nRH.G85.daytime.sum_14,drawid) |> 
+  summarize(draw = mean(draw)*100,.groups = "drop") |>
+  mutate(fa1.20_7.TRH.13T16nRH.G85.daytime.sum_14 = 
+           (fa1.20_7.TRH.13T16nRH.G85.daytime.sum_14*sd_data["fa1.20_7.TRH.13T16nRH.G85.daytime.sum_14"] + mean_data["fa1.20_7.TRH.13T16nRH.G85.daytime.sum_14"])) |>
+  ggplot(aes(x = fa1.20_7.TRH.13T16nRH.G85.daytime.sum_14,y = draw)) +
+  stat_lineribbon(alpha = 0.7) +
+    scale_fill_manual(values = c(harmonious_palette[6], harmonious_palette[5], harmonious_palette[2]),guide = "none")+
+  xlab("Cumulative hours (or events) over the optimal epidemiological period") +
+  ylab("SNB severity (%)")+
+  labs(fill = "Credible interval") +
+  theme(legend.position = "none")
+
+
+
+avg_comparisons(
+  M7,
+  datagrid(fa1.20_7.TRH.13T16nRH.G85.daytime.sum_14 = grida,
+           grid_type = "counterfactual"), 
+  variables="fa1.20_7.TRH.13T16nRH.G85.daytime.sum_14")
+
+
+rm(grida)
+rm(pred_res)
+gc()
+```
+
+```{r,echo=FALSE}
+
+### fa1.20_6.TR.19T22nR.G.0.2.daytime.sum_28
+# Create a sequence of values for the specified weather term
+grida = seq(min(SNB_train$fa1.20_6.TR.19T22nR.G.0.2.daytime.sum_28), 
+             max(SNB_train$fa1.20_6.TR.19T22nR.G.0.2.daytime.sum_28), by = 0.1)
+
+# Generate predictions
+pred_res = predictions(
+  model = M7,
+  newdata = datagrid(fa1.20_6.TR.19T22nR.G.0.2.daytime.sum_28= grida),
+  by = "fa1.20_6.TR.19T22nR.G.0.2.daytime.sum_28",
+  re_formula = NA,
+  allow_new_levels = TRUE,
+  sample_new_levels = "uncertainty"
+)
+
+two = pred_res  |>
+  posterior_draws() |>  
+  group_by(fa1.20_6.TR.19T22nR.G.0.2.daytime.sum_28,drawid) |> 
+  summarize(draw = mean(draw)*100,.groups = "drop") |>
+  mutate(fa1.20_6.TR.19T22nR.G.0.2.daytime.sum_28 = 
+           (fa1.20_6.TR.19T22nR.G.0.2.daytime.sum_28*sd_data["fa1.20_6.TR.19T22nR.G.0.2.daytime.sum_28"] + mean_data["fa1.20_6.TR.19T22nR.G.0.2.daytime.sum_28"])) |>
+  ggplot(aes(x = fa1.20_6.TR.19T22nR.G.0.2.daytime.sum_28,y = draw)) +
+  stat_lineribbon(alpha = 0.7) +
+    scale_fill_manual(values = c(harmonious_palette[6], harmonious_palette[5], harmonious_palette[2]),guide = "none")+
+  xlab("Cumulative hours (or events) over the optimal epidemiological period") +
+  ylab("SNB severity (%)")+
+  labs(fill = "Credible interval") +
+  theme(legend.position = "none")
+
+avg_comparisons(
+  M7,
+  datagrid(fa1.20_6.TR.19T22nR.G.0.2.daytime.sum_28 = grida,
+           grid_type = "counterfactual"), 
+  variables="fa1.20_6.TR.19T22nR.G.0.2.daytime.sum_28")
+
+
+rm(grida)
+rm(pred_res)
+gc()
+```
+
+```{r,echo=FALSE}
+### fa1.77_71.RH.G90.dusk.sum_14
+
+# Create a sequence of values for the specified weather term
+grida = seq(min(SNB_train$fa1.77_71.RH.G90.dusk.sum_14), 
+             max(SNB_train$fa1.77_71.RH.G90.dusk.sum_14), by = 0.1)
+
+# Generate predictions
+pred_res = predictions(
+  model = M7,
+  newdata = datagrid(fa1.77_71.RH.G90.dusk.sum_14= grida),
+  by = "fa1.77_71.RH.G90.dusk.sum_14",
+  re_formula = NA,
+  allow_new_levels = TRUE,
+  sample_new_levels = "uncertainty"
+)
+
+three = pred_res  |>
+  posterior_draws() |>  
+  group_by(fa1.77_71.RH.G90.dusk.sum_14,drawid) |> 
+  summarize(draw = mean(draw)*100,.groups = "drop") |>
+  mutate(fa1.77_71.RH.G90.dusk.sum_14 = 
+           (fa1.77_71.RH.G90.dusk.sum_14*sd_data["fa1.77_71.RH.G90.dusk.sum_14"] + mean_data["fa1.77_71.RH.G90.dusk.sum_14"])) |>
+  ggplot(aes(x = fa1.77_71.RH.G90.dusk.sum_14,y = draw)) +
+  stat_lineribbon(alpha = 0.7) +
+  scale_fill_manual(values = c(harmonious_palette[6], harmonious_palette[5], harmonious_palette[2]),guide = "none")+
+  xlab("Cumulative hours (or events) over the optimal epidemiological period") +
+  ylab("SNB severity (%)")+
+  labs(fill = "Credible interval") +
+  theme(legend.position = "none")
+
+
+
+avg_comparisons(
+  M7,
+  datagrid(fa1.77_71.RH.G90.dusk.sum_14 = grida,
+           grid_type = "counterfactual"), 
+  variables="fa1.77_71.RH.G90.dusk.sum_14")
+
+
+rm(grida)
+rm(pred_res)
+gc()
+```
+```{r,echo=FALSE}
+### fa1.66_58.R.0.6.rl.count2.daytime.sum_28
+
+# Create a sequence of values for the specified weather term
+grida = seq(min(SNB_train$fa1.66_58.R.0.6.rl.count2.daytime.sum_28), 
+             max(SNB_train$fa1.66_58.R.0.6.rl.count2.daytime.sum_28), by = 0.1)
+
+# Generate predictions
+pred_res = predictions(
+  model = M7,
+  newdata = datagrid(fa1.66_58.R.0.6.rl.count2.daytime.sum_28= grida),
+  by = "fa1.66_58.R.0.6.rl.count2.daytime.sum_28",
+  re_formula = NA,
+  allow_new_levels = TRUE,
+  sample_new_levels = "uncertainty"
+)
+
+four = pred_res  |>
+  posterior_draws() |>  
+  group_by(fa1.66_58.R.0.6.rl.count2.daytime.sum_28,drawid) |> 
+  summarize(draw = mean(draw)*100,.groups = "drop") |>
+  mutate(fa1.66_58.R.0.6.rl.count2.daytime.sum_28 = 
+           (fa1.66_58.R.0.6.rl.count2.daytime.sum_28*sd_data["fa1.66_58.R.0.6.rl.count2.daytime.sum_28"] + mean_data["fa1.66_58.R.0.6.rl.count2.daytime.sum_28"])) |>
+  ggplot(aes(x = fa1.66_58.R.0.6.rl.count2.daytime.sum_28,y = draw)) +
+  stat_lineribbon(alpha = 0.7) +
+    scale_fill_manual(values = c(harmonious_palette[6], harmonious_palette[5], harmonious_palette[2]),guide = "none")+
+  xlab("Cumulative hours (or events) over the optimal epidemiological period") +
+  ylab("SNB severity (%)")+
+  labs(fill = "Credible interval") +
+  theme(legend.position = "none")
+
+avg_comparisons(
+  M7,
+  datagrid(fa1.66_58.R.0.6.rl.count2.daytime.sum_28 = grida,
+           grid_type = "counterfactual"), 
+  variables="fa1.66_58.R.0.6.rl.count2.daytime.sum_28")
+
+
+rm(grida)
+rm(pred_res)
+gc()
+```
+
+
+```{r,echo=FALSE}
+### fa1.15_8.T.22T25.nighttime.sum_14
+
+# Create a sequence of values for the specified weather term
+grida = seq(min(SNB_train$fa1.15_8.T.22T25.nighttime.sum_14), 
+             max(SNB_train$fa1.15_8.T.22T25.nighttime.sum_14), by = 0.1)
+
+# Generate predictions
+pred_res = predictions(
+  model = M7,
+  newdata = datagrid(fa1.15_8.T.22T25.nighttime.sum_14= grida),
+  by = "fa1.15_8.T.22T25.nighttime.sum_14",
+  re_formula = NA,
+  allow_new_levels = TRUE,
+  sample_new_levels = "uncertainty"
+)
+
+five = pred_res  |>
+  posterior_draws() |>  
+  group_by(fa1.15_8.T.22T25.nighttime.sum_14,drawid) |> 
+  summarize(draw = mean(draw)*100,.groups = "drop") |>
+  mutate(fa1.15_8.T.22T25.nighttime.sum_14 = 
+           (fa1.15_8.T.22T25.nighttime.sum_14*sd_data["fa1.15_8.T.22T25.nighttime.sum_14"] + mean_data["fa1.15_8.T.22T25.nighttime.sum_14"])) |>
+  ggplot(aes(x = fa1.15_8.T.22T25.nighttime.sum_14,y = draw)) +
+  stat_lineribbon(alpha = 0.7) +
+    scale_fill_manual(values = c(harmonious_palette[6], harmonious_palette[5], harmonious_palette[2]),guide = "none")+
+  xlab("Cumulative hours (or events) over the optimal epidemiological period") +
+  ylab("SNB severity (%)")+
+  labs(fill = "Credible interval") +
+  theme(legend.position = "none")
+
+avg_comparisons(
+  M7,
+  datagrid(fa1.15_8.T.22T25.nighttime.sum_14 = grida,
+           grid_type = "counterfactual"), 
+  variables="fa1.15_8.T.22T25.nighttime.sum_14")
+
+
+rm(grida)
+rm(pred_res)
+gc()
+```
+
+
+```{r,echo=FALSE}
+
+### fa1.20_12.ETo.G0.4.dusk.sum_14
+# Create a sequence of values for the specified weather term
+grida = seq(min(SNB_train$fa1.20_12.ETo.G0.4.dusk.sum_14), 
+             max(SNB_train$fa1.20_12.ETo.G0.4.dusk.sum_14), by = 0.1)
+
+# Generate predictions
+pred_res = predictions(
+  model = M7,
+  newdata = datagrid(fa1.20_12.ETo.G0.4.dusk.sum_14= grida),
+  by = "fa1.20_12.ETo.G0.4.dusk.sum_14",
+  re_formula = NA,
+  allow_new_levels = TRUE,
+  sample_new_levels = "uncertainty"
+)
+
+six = pred_res  |>
+  posterior_draws() |>  
+  group_by(fa1.20_12.ETo.G0.4.dusk.sum_14,drawid) |> 
+  summarize(draw = mean(draw)*100,.groups = "drop") |>
+  mutate(fa1.20_12.ETo.G0.4.dusk.sum_14 = 
+           (fa1.20_12.ETo.G0.4.dusk.sum_14*sd_data["fa1.20_12.ETo.G0.4.dusk.sum_14"] + mean_data["fa1.20_12.ETo.G0.4.dusk.sum_14"])) |>
+  ggplot(aes(x = fa1.20_12.ETo.G0.4.dusk.sum_14,y = draw)) +
+  stat_lineribbon(alpha = 0.7) +
+  scale_fill_manual(values = c(harmonious_palette[6], harmonious_palette[5], harmonious_palette[2]),guide = "none")+
+  xlab("Cumulative hours (or events) over the optimal epidemiological period") +
+  ylab("SNB severity (%)")+
+  labs(fill = "Credible interval") +
+  theme(legend.position = "none")
+
+
+
+avg_comparisons(
+  M7,
+  datagrid(fa1.20_12.ETo.G0.4.dusk.sum_14 = grida,
+           grid_type = "counterfactual"), 
+  variables="fa1.20_12.ETo.G0.4.dusk.sum_14")
+
+
+rm(grida)
+rm(pred_res)
+gc()
+```
+
+
+```{r, echo=FALSE,fig.height=8,fig.width=6}
+plot_list = list(
+  one,
+  two,
+  three,
+  four,
+  five,
+  six)
+
+combined_plot1 =  
+  (wrap_plots(plot_list, ncol = 2) + 
+    plot_layout(axis_titles = "collect", guides = "collect") & 
+    theme(legend.position = "bottom")) +
+  plot_annotation(tag_levels = 'A');combined_plot1
+
+ggsave("results/figures/fig5.tiff",width =6,height =8,units = "in",limitsize = FALSE,dpi = 600)
+
+```
+
+# Session info {-}
+
+```{r}
+
+sessionInfo()
+```
