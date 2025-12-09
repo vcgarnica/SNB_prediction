@@ -85,7 +85,7 @@ SNB_bayesian/
 └── Bayesian_SNB_model.html
 ```
 
-## Analysis Pipeline
+## Analysis pipeline
 
 The complete analysis workflow is fully described in `Bayesian_SNB_model.Rmd` and rendered in `Bayesian_SNB_model.html`. The pipeline integrates data preparation, model fitting, diagnostics, and visualization to develop hierarchical Bayesian models for SNB severity prediction. 
 
@@ -95,24 +95,24 @@ Nine Bayesian beta regression models (M1-M9) were fitted using the `brms` packag
 
 Publication-ready figures are available in `results/figures/`, including main figures (`fig1.tiff` through `fig5.tiff`) and supplementary figures (`figS1.tiff` through `figS7.tiff`).
 
-### Additional Scripts
+### Additional scripts
 
 The `9_relationship_matrix.R` script generates correlation matrices and visualizations of relationships between weather variables and disease severity across environments.
 
 The `10_simulation_plots.R` script creates visualizations for simulation studies validating model performance under various scenarios.
 
-### Simulation Study
+### Simulation study 
 
 The `simulation/` directory contains a complete simulation study evaluating model performance:
 - `Simulation.Rmd`: R Markdown document with simulation code and analysis
 - `Simulation.html`: Rendered report of simulation results
-- Supporting data files: `data_final_sev.RData`, `K_obs.RData`, `sev_c.RData`, `sev_u.RData`
+- Supporting data files: `sev_c.RData`, `sev_u.RData`
 
-### Window Pane Analysis
+### Window pane analysis
 
 The `code/Window pane/` directory contains a self-contained sub-analysis extracting disease-associated weather variables 
 through windowed temporal analysis, with its own code, data, figures, and results subdirectories. You can find further information in
-[Garnica and Ojiambo 2025)](https://www.frontiersin.org/journals/plant-science/articles/10.3389/fpls.2025.1637130/full) and the project's [repository](https://github.com/vcgarnica/SNB_window_pane).
+[Garnica and Ojiambo (2025)](https://www.frontiersin.org/journals/plant-science/articles/10.3389/fpls.2025.1637130/full) and the project's [repository](https://github.com/vcgarnica/SNB_window_pane).
 
 ## References
 
